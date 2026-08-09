@@ -1,0 +1,17 @@
+{
+  "name": "Nexo — Asistente de Carlos",
+  "short_name": "Nexo",
+  "description": "Trabajo, universidad y vida personal en un solo lugar.",
+  "lang": "es-CL",
+  "start_url": "./nexo.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#F4F6F9",
+  "theme_color": "#0D5C63",
+  "categories": ["productivity", "education"],
+  "icons": [
+    { "src": "icono.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icono-maskable.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}
