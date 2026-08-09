@@ -364,8 +364,25 @@ const TABLAS = ['brands','stores','people','person_events','requests','agreement
 
 /* ==========================================================================
    3. ESTADO Y PERSISTENCIA
+   --------------------------------------------------------------------------
+   Supabase es la fuente principal de los datos. Lo que vive en el navegador es
+   una caché: acelera el arranque y permite trabajar sin conexión, pero nunca
+   manda sobre la nube salvo por los cambios que todavía no alcanzaron a subir.
+
+   La caché está separada por cuenta. Cada usuario tiene su propia llave, así
+   que al cambiar de sesión nunca se mezcla información de dos personas.
    ========================================================================== */
-const LS_DB = 'nexo.db.v1', LS_UI = 'nexo.ui.v1', LS_SB = 'nexo.supabase.v1';
+const LS_DB_BASE = 'nexo.db.v1', LS_UI = 'nexo.ui.v1', LS_SB = 'nexo.supabase.v1';
+const LS_COLA_BASE = 'nexo.cola.v1', LS_SYNC_BASE = 'nexo.sync.v1';
+
+/** Llave de almacenamiento para la cuenta activa. `null` = sesión local. */
+function claveDe(base, userId) { return base + '::' + (userId || 'local'); }
+
+/* Llaves activas. `aplicarUsuario()` las cambia al entrar y salir. */
+let LS_DB = claveDe(LS_DB_BASE, null);
+let LS_COLA = claveDe(LS_COLA_BASE, null);
+let LS_SYNC = claveDe(LS_SYNC_BASE, null);
+let USUARIO_CACHE = null;
 
 let DB = {};
 let UI = {
@@ -381,35 +398,90 @@ function saveUI() {
     localStorage.setItem(LS_UI, JSON.stringify({ space, route, tareaVista, tema }));
   } catch (e) {}
 }
-function loadLocal() {
-  try {
-    const raw = localStorage.getItem(LS_DB);
-    if (raw) DB = JSON.parse(raw);
-  } catch (e) { DB = {}; }
-  try {
-    const u = JSON.parse(localStorage.getItem(LS_UI) || '{}');
-    Object.assign(UI, u);
-  } catch (e) {}
-  if (!DB || !DB.profile) DB = seedDemo();
+
+/** Deja la base en un estado consistente: arreglos completos y marcas de tiempo. */
+function normalizarDB() {
+  if (!DB || typeof DB !== 'object') DB = {};
+  if (!DB.profile) { DB = seedDemo(); return; }
   TABLAS.forEach(t => { if (!Array.isArray(DB[t])) DB[t] = []; });
+  /* Sin marca de edición no se puede resolver un conflicto. Se completa una vez. */
+  const ahora = nowNaive();
+  TABLAS.forEach(t => DB[t].forEach(r => {
+    if (!r.created_at) r.created_at = ahora;
+    if (!r.updated_at) r.updated_at = r.created_at;
+  }));
 }
 
-/* --- API de datos: siempre local, y espejo en Supabase si está conectado --- */
+/**
+ * Lee la caché de la cuenta indicada. Si no existe y es la sesión local,
+ * recupera la caché antigua (una sola llave para todos) y la adopta.
+ */
+function loadLocal(userId) {
+  LS_DB = claveDe(LS_DB_BASE, userId);
+  LS_COLA = claveDe(LS_COLA_BASE, userId);
+  LS_SYNC = claveDe(LS_SYNC_BASE, userId);
+  USUARIO_CACHE = userId || null;
+
+  let raw = null;
+  try { raw = localStorage.getItem(LS_DB); } catch (e) {}
+  if (raw == null && !userId) {
+    /* Migración de la versión anterior, que guardaba todo en una sola llave. */
+    try {
+      const viejo = localStorage.getItem(LS_DB_BASE);
+      if (viejo) { raw = viejo; localStorage.setItem(LS_DB, viejo); localStorage.removeItem(LS_DB_BASE); }
+    } catch (e) {}
+  }
+  try { DB = raw ? JSON.parse(raw) : {}; } catch (e) { DB = {}; }
+
+  try { Object.assign(UI, JSON.parse(localStorage.getItem(LS_UI) || '{}')); } catch (e) {}
+  normalizarDB();
+}
+
+/**
+ * Cambia la caché activa. Se usa al entrar y al salir de una cuenta.
+ * La primera vez que entras con una cuenta nueva, lo que tenías trabajando en
+ * este equipo se hereda para que puedas decidir si subirlo. No se pierde nada.
+ */
+function aplicarUsuario(userId) {
+  const destino = userId || null;
+  if (destino === USUARIO_CACHE) return false;
+  saveDB();                       // asegura la copia de la cuenta que se deja
+
+  let existe = false;
+  try { existe = localStorage.getItem(claveDe(LS_DB_BASE, destino)) != null; } catch (e) {}
+  const heredar = destino && !existe && USUARIO_CACHE === null && DB && DB.profile;
+  const copia = heredar ? JSON.parse(JSON.stringify(DB)) : null;
+
+  loadLocal(destino);
+  if (copia) { DB = copia; saveDB(); }
+  return true;
+}
+
+/* --- API de datos: escribe local, encola para Supabase --------------------- */
 function dejarDeSerDemo() { if (DB.esDemo) { DB.esDemo = false; } }
+
+/** Instante exacto de la edición, en UTC. Es lo que decide un conflicto. */
+function marcaEdicion() { return new Date().toISOString(); }
 
 const store = {
   all(t) { return DB[t] || []; },
   get(t, id) { return (DB[t] || []).find(r => r.id === id); },
   insert(t, row) {
     const r = Object.assign({ id: uid(), created_at: nowNaive(), updated_at: nowNaive() }, row);
-    (DB[t] = DB[t] || []).push(r); dejarDeSerDemo(); saveDB(); Cloud.push(t, r); return r;
+    r._editado_en = marcaEdicion();
+    (DB[t] = DB[t] || []).push(r); dejarDeSerDemo(); saveDB(); encolarCambio('upsert', t, r.id); return r;
   },
   update(t, id, patch) {
     const r = store.get(t, id); if (!r) return null;
-    Object.assign(r, patch, { updated_at: nowNaive() }); dejarDeSerDemo(); saveDB(); Cloud.push(t, r); return r;
+    Object.assign(r, patch, { updated_at: nowNaive(), _editado_en: marcaEdicion() });
+    dejarDeSerDemo(); saveDB(); encolarCambio('upsert', t, id); return r;
   },
   remove(t, id) {
-    DB[t] = (DB[t] || []).filter(r => r.id !== id); dejarDeSerDemo(); saveDB(); Cloud.remove(t, id);
+    const r = store.get(t, id);
+    DB[t] = (DB[t] || []).filter(x => x.id !== id); dejarDeSerDemo(); saveDB();
+    /* El borrado viaja con una copia de la fila: hace falta para saber a qué
+       tabla remota apunta (una reunión y un evento personal se guardan aparte). */
+    if (r) encolarCambio('delete', t, id, r);
   },
   where(t, fn) { return (DB[t] || []).filter(fn); }
 };
@@ -447,7 +519,13 @@ const E = {
   notaT:     { nota: 'note', apunte: 'class_note', idea: 'idea', minuta: 'minutes' },
   fuenteT:   { ley: 'law', codigo: 'code', decreto: 'decree', sentencia: 'ruling', doctrina: 'doctrine', otro: 'other' },
   casoE:     { borrador: 'draft', en_analisis: 'in_review', resuelto: 'done' },
-  preguntaT: { seleccion_multiple: 'multiple_choice', desarrollo: 'open' }
+  preguntaT: { seleccion_multiple: 'multiple_choice', desarrollo: 'open' },
+  preparacion:  { no_iniciada: 'not_started', leyendo: 'reading', ejercitando: 'practicing', lista: 'ready' },
+  vigencia:     { por_verificar: 'to_verify', vigente: 'in_force', modificada: 'amended', derogada: 'repealed' },
+  concentracion:{ baja: 'low', media: 'medium', alta: 'high' },
+  resultadoS:   { pendiente: 'pending', completada: 'completed', parcial: 'partial', interrumpida: 'interrupted' },
+  repaso:       { correcto: 'correct', incorrecto: 'incorrect', parcial: 'partial', omitido: 'skipped' },
+  itemRepaso:   { flashcard: 'flashcard', practice_question: 'practice_question', case_brief: 'case_brief' }
 };
 const EI = {}; for (const k in E) EI[k] = inv(E[k]);
 const aR = (dic, v, def) => E[dic][v] || def || Object.values(E[dic])[0];
@@ -509,10 +587,10 @@ const MAPA = {
       is_active: s.activa !== false,
       schedule: (s.horario || []).map(h => ({ day: h.dia, start: h.inicio, end: h.fin })),
       bibliography: (s.bibliografia || []).map(b => ({ title: b.titulo, author: b.autor || '', required: !!b.obligatorio })),
-      links: linksOut(s.enlaces) }),
+      links: linksOut(s.enlaces), is_demo: !!s.es_demo }),
     in_: r => ({ id: r.id, nombre: r.name, codigo: r.code || '', profesor: r.professor || '',
       sala_modalidad: r.room_modality || '', creditos: r.credits, color: r.color, activa: r.is_active,
-      periodo: r.periodo_nombre || '',
+      periodo: r.periodo_nombre || '', es_demo: !!r.is_demo,
       horario: (r.schedule || []).map(h => ({ dia: h.day, inicio: h.start, fin: h.end })),
       bibliografia: (r.bibliography || []).map(b => ({ titulo: b.title, autor: b.author || '', obligatorio: !!b.required })),
       enlaces: linksIn(r.links) }) },
@@ -526,20 +604,32 @@ const MAPA = {
   evaluations: { remota: 'assessments',
     out: e => ({ id: e.id, course_id: e.subject_id, title: e.titulo, type: aR('evalT', e.tipo),
       due_date: soloFecha(e.fecha), due_time: e.hora ? e.hora + ':00' : null,
-      weight: Number(e.ponderacion) || 0, status: aR('evalE', e.estado), syllabus: e.temario || null }),
+      weight: Number(e.ponderacion) || 0, status: aR('evalE', e.estado), syllabus: e.temario || null,
+      target_grade: e.nota_objetivo == null || e.nota_objetivo === '' ? null : Number(e.nota_objetivo),
+      preparation: aR('preparacion', e.preparacion || 'no_iniciada'),
+      included_topics: e.materia || null, documents: linksOut(e.documentos),
+      location: e.lugar || null,
+      duration_min: e.duracion_min ? clamp(Number(e.duracion_min), 5, 600) : null }),
     in_: r => ({ id: r.id, subject_id: r.course_id, titulo: r.title, tipo: aL('evalT', r.type),
       fecha: r.due_date, hora: r.due_time ? String(r.due_time).slice(0, 5) : null,
       ponderacion: Number(r.weight), estado: aL('evalE', r.status), temario: r.syllabus || '',
+      nota_objetivo: r.target_grade == null ? null : Number(r.target_grade),
+      preparacion: aL('preparacion', r.preparation), materia: r.included_topics || '',
+      documentos: linksIn(r.documents), lugar: r.location || '', duracion_min: r.duration_min,
       nota: r.grades && r.grades.length ? Number(r.grades[r.grades.length - 1].score) : null }) },
 
   readings: { remota: 'readings',
     out: r => ({ id: r.id, course_id: r.subject_id || null, title: r.titulo, author: r.autor || null,
       source_url: r.enlace || null, total_pages: r.paginas_total || 0,
       pages_read: Math.min(r.paginas_leidas || 0, r.paginas_total || 0),
-      due_date: soloFecha(r.fecha_limite), priority: aR('prioridad', r.prioridad) }),
+      due_date: soloFecha(r.fecha_limite), priority: aR('prioridad', r.prioridad),
+      estimated_min_per_page: clamp(Number(r.min_por_pagina) || 2.5, 0.1, 60),
+      edition: r.edicion || null, is_required: r.obligatoria !== false, notes: r.notas || null }),
     in_: r => ({ id: r.id, subject_id: r.course_id, titulo: r.title, autor: r.author || '',
       enlace: r.source_url || '', paginas_total: r.total_pages, paginas_leidas: r.pages_read,
-      fecha_limite: r.due_date, prioridad: aL('prioridad', r.priority) }) },
+      fecha_limite: r.due_date, prioridad: aL('prioridad', r.priority),
+      min_por_pagina: Number(r.estimated_min_per_page) || 2.5, edicion: r.edition || '',
+      obligatoria: r.is_required !== false, notas: r.notes || '' }) },
 
   study_plans: { remota: 'study_plans',
     out: p => ({ id: p.id, course_id: p.subject_id || null, assessment_id: p.evaluation_id || null,
@@ -552,35 +642,92 @@ const MAPA = {
     out: s => ({ id: s.id, plan_id: s.plan_id || null, course_id: s.subject_id || null, unit_id: s.unit_id || null,
       title: s.titulo, scheduled_date: soloFecha(s.fecha), scheduled_time: s.hora ? s.hora + ':00' : null,
       duration_min: clamp(s.duracion_min || 60, 5, 600), type: aR('sesionT', s.tipo),
-      status: aR('sesionE', s.estado), effective_min: Math.max(0, s.minutos_efectivos || 0), notes: s.notas || null }),
+      status: aR('sesionE', s.estado), effective_min: Math.max(0, s.minutos_efectivos || 0), notes: s.notas || null,
+      objective: s.objetivo || null, material: s.material || [],
+      breaks_count: Math.max(0, Number(s.pausas) || 0),
+      focus: s.concentracion ? aR('concentracion', s.concentracion) : null,
+      outcome: aR('resultadoS', s.resultado || 'pendiente'), next_step: s.proximo_paso || null,
+      started_at: tzOut(s.iniciada), ended_at: tzOut(s.terminada),
+      reading_page: s.pagina_lectura == null || s.pagina_lectura === '' ? null : Math.max(0, Number(s.pagina_lectura)) }),
     in_: r => ({ id: r.id, plan_id: r.plan_id, subject_id: r.course_id, unit_id: r.unit_id, titulo: r.title,
       fecha: r.scheduled_date, hora: r.scheduled_time ? String(r.scheduled_time).slice(0, 5) : null,
       duracion_min: r.duration_min, tipo: aL('sesionT', r.type), estado: aL('sesionE', r.status),
-      minutos_efectivos: r.effective_min, notas: r.notes || '' }) },
+      minutos_efectivos: r.effective_min, notas: r.notes || '', objetivo: r.objective || '',
+      material: r.material || [], pausas: r.breaks_count || 0,
+      concentracion: r.focus ? aL('concentracion', r.focus) : null,
+      resultado: aL('resultadoS', r.outcome), proximo_paso: r.next_step || '',
+      iniciada: tzIn(r.started_at), terminada: tzIn(r.ended_at), pagina_lectura: r.reading_page }) },
 
   glossary: { remota: 'legal_concepts',
     out: g => ({ id: g.id, course_id: g.subject_id || null, term: g.termino, definition: g.definicion || '—',
-      origin: g.fuente || null, verification: g.verificado ? 'verified' : 'unverified' }),
+      origin: g.fuente || null, verification: g.verificado ? 'verified' : 'unverified',
+      tags: g.etiquetas || [] }),
     in_: r => ({ id: r.id, subject_id: r.course_id, termino: r.term, definicion: r.definition,
-      fuente: r.origin || '', verificado: r.verification === 'verified', etiquetas: [] }) },
+      fuente: r.origin || '', verificado: r.verification === 'verified', etiquetas: r.tags || [] }) },
 
   legal_sources: { remota: 'legal_sources',
     out: f => ({ id: f.id, course_id: f.subject_id || null, type: aR('fuenteT', f.tipo),
       identifier: f.identificador, title: f.titulo || null, court: f.tribunal || null, docket: f.rol || null,
       issued_on: soloFecha(f.fecha), subject_matter: f.materia || null, official_url: f.enlace || null,
-      summary: f.resumen || null, verification: f.verificado ? 'verified' : 'unverified' }),
+      summary: f.resumen || null, verification: f.verificado ? 'verified' : 'unverified',
+      number: f.numero || null, article: f.articulo || null, recorded_text: f.texto_registrado || null,
+      parties: f.partes || null, facts: f.hechos || null, decision: f.decision || null,
+      reasoning: f.fundamentos || null, consulted_on: soloFecha(f.consultada_el),
+      validity: aR('vigencia', f.vigencia || 'por_verificar'), is_demo: !!f.es_demo }),
     in_: r => ({ id: r.id, subject_id: r.course_id, tipo: aL('fuenteT', r.type), identificador: r.identifier,
       titulo: r.title || '', tribunal: r.court || '', rol: r.docket || '', fecha: r.issued_on,
       materia: r.subject_matter || '', enlace: r.official_url || '', resumen: r.summary || '',
-      verificado: r.verification === 'verified' }) },
+      verificado: r.verification === 'verified', numero: r.number || '', articulo: r.article || '',
+      texto_registrado: r.recorded_text || '', partes: r.parties || '', hechos: r.facts || '',
+      decision: r.decision || '', fundamentos: r.reasoning || '', consultada_el: r.consulted_on,
+      vigencia: aL('vigencia', r.validity), es_demo: !!r.is_demo }) },
 
   cases: { remota: 'case_briefs',
     out: c => ({ id: c.id, course_id: c.subject_id || null, title: c.titulo, facts: c.hechos || null,
       legal_issue: c.problema || null, rules: c.normas || null, arguments: c.argumentos || null,
-      conclusion: c.conclusion || null, status: aR('casoE', c.estado) }),
+      conclusion: c.conclusion || null, status: aR('casoE', c.estado),
+      parties: c.partes || null, arguments_claimant: c.argumentos_demandante || null,
+      arguments_defendant: c.argumentos_demandado || null, decision: c.decision || null,
+      reasoning: c.fundamentos || null, personal_opinion: c.opinion || null,
+      source_reference: c.fuente || null,
+      verification: c.verificado ? 'verified' : 'unverified', is_demo: !!c.es_demo }),
     in_: r => ({ id: r.id, subject_id: r.course_id, titulo: r.title, hechos: r.facts || '',
       problema: r.legal_issue || '', normas: r.rules || '', argumentos: r.arguments || '',
-      conclusion: r.conclusion || '', estado: aL('casoE', r.status) }) },
+      conclusion: r.conclusion || '', estado: aL('casoE', r.status), partes: r.parties || '',
+      argumentos_demandante: r.arguments_claimant || '', argumentos_demandado: r.arguments_defendant || '',
+      decision: r.decision || '', fundamentos: r.reasoning || '', opinion: r.personal_opinion || '',
+      fuente: r.source_reference || '', verificado: r.verification === 'verified', es_demo: !!r.is_demo }) },
+
+  /* --- Universidad: apuntes, citas de lectura y repaso --------------------
+     El texto original del apunte viaja en `body` y no se toca nunca. Lo que
+     derivaste después va en columnas aparte, tal como se muestra en pantalla. */
+  legal_notes: { remota: 'legal_notes',
+    out: n => ({ id: n.id, course_id: n.subject_id || null, unit_id: n.unit_id || null,
+      title: n.titulo, body: n.texto_original || '', topic: n.tema || null,
+      summary: n.resumen || null, key_concepts: n.conceptos || [], norms_mentioned: n.normas || [],
+      case_law_mentioned: n.jurisprudencia || [], tags: n.etiquetas || [],
+      derived_at: tzOut(n.derivado_en), derived_by: n.derivado_por || null,
+      verification: 'unverified' }),
+    in_: r => ({ id: r.id, subject_id: r.course_id, unit_id: r.unit_id, titulo: r.title,
+      texto_original: r.body || '', tema: r.topic || '', resumen: r.summary || '',
+      conceptos: r.key_concepts || [], normas: r.norms_mentioned || [],
+      jurisprudencia: r.case_law_mentioned || [], etiquetas: r.tags || [],
+      derivado_en: tzIn(r.derived_at), derivado_por: r.derived_by || null }) },
+
+  reading_notes: { remota: 'reading_notes',
+    out: c => ({ id: c.id, reading_id: c.reading_id, page: c.pagina == null || c.pagina === '' ? null : Math.max(0, Number(c.pagina)),
+      quote: c.cita || null, comment: c.comentario || null, is_verbatim: c.textual !== false }),
+    in_: r => ({ id: r.id, reading_id: r.reading_id, pagina: r.page, cita: r.quote || '',
+      comentario: r.comment || '', textual: r.is_verbatim !== false }) },
+
+  review_attempts: { remota: 'review_attempts',
+    out: a => ({ id: a.id, item_type: aR('itemRepaso', a.item_tipo, 'flashcard'), item_id: a.item_id,
+      course_id: a.subject_id || null, unit_id: a.unit_id || null,
+      result: aR('repaso', a.resultado || 'correcto'), seconds: Math.max(0, Number(a.segundos) || 0),
+      answered_at: tzOut(a.respondida_en) }),
+    in_: r => ({ id: r.id, item_tipo: aL('itemRepaso', r.item_type, 'flashcard'), item_id: r.item_id,
+      subject_id: r.course_id, unit_id: r.unit_id, resultado: aL('repaso', r.result),
+      segundos: r.seconds, respondida_en: tzIn(r.answered_at) }) },
 
   time_blocks: { remota: 'time_blocks',
     out: b => ({ id: b.id, space: aR('area', b.area), title: b.titulo, block_date: soloFecha(b.fecha),
@@ -593,10 +740,11 @@ const MAPA = {
   notes: { remota: 'notes',
     out: n => ({ id: n.id, space: aR('area', n.area), type: aR('notaT', n.tipo), title: n.titulo,
       content: n.contenido || null, brand_id: n.brand_id || null, course_id: n.subject_id || null,
-      unit_id: n.subject_id ? (n.unit_id || null) : null, topic: n.tema || null, is_pinned: !!n.fijada }),
+      unit_id: n.subject_id ? (n.unit_id || null) : null, topic: n.tema || null, is_pinned: !!n.fijada,
+      tags: n.etiquetas || [] }),
     in_: r => ({ id: r.id, area: aL('area', r.space), tipo: aL('notaT', r.type), titulo: r.title,
       contenido: r.content || '', brand_id: r.brand_id, subject_id: r.course_id, unit_id: r.unit_id,
-      tema: r.topic || '', fijada: r.is_pinned, etiquetas: [] }) },
+      tema: r.topic || '', fijada: r.is_pinned, etiquetas: r.tags || [] }) },
 
   tasks: { remota: 'tasks',
     out: t => ({ id: t.id, space: aR('area', t.area), title: t.titulo, description: t.descripcion || null,
@@ -615,35 +763,184 @@ const MAPA = {
 /* Tablas locales que se sincronizan por el mapa directo */
 const TABLAS_MAPEADAS = Object.keys(MAPA);
 
+/* Camino inverso: de la tabla remota a la local. Lo usa Realtime. */
+const POR_REMOTA = {};
+TABLAS_MAPEADAS.forEach(t => { POR_REMOTA[MAPA[t].remota] = t; });
+
+/* Orden de subida: primero los padres, después lo que los referencia. */
+const ORDEN_SUBIDA = ['brands', 'stores', 'people', 'person_events', 'requests', 'subjects', 'units',
+  'evaluations', 'readings', 'study_plans', 'study_sessions', 'glossary', 'legal_sources', 'cases',
+  'legal_notes', 'reading_notes', 'review_attempts', 'tasks', 'notes', 'time_blocks'];
+
+/* Tablas remotas que Nexo escucha en tiempo real. Las que no están en el mapa
+   directo (contactos, subtareas, notas, reuniones…) obligan a una bajada
+   completa porque se reconstruyen a partir de varias tablas. */
+const TABLAS_REALTIME = ['brands', 'contacts', 'stores', 'people', 'people_events', 'requests', 'incidents',
+  'meetings', 'meeting_participants', 'agreements', 'courses', 'course_units', 'class_sessions',
+  'assessments', 'grades', 'readings', 'study_plans', 'study_sessions', 'legal_sources', 'legal_concepts',
+  'legal_notes', 'flashcards', 'practice_questions', 'case_briefs', 'tasks', 'subtasks', 'notes',
+  'personal_events', 'time_blocks', 'reading_notes', 'review_attempts', 'user_settings'];
+
+/** Puente entre `store` y la nube que no depende del orden de declaración. */
+function encolarCambio(op, tabla, id, copia) {
+  try { if (typeof Cloud !== 'undefined' && Cloud) Cloud.encolar(op, tabla, id, copia); }
+  catch (e) { console.warn('No se pudo encolar el cambio', e); }
+}
+
+/** Asegura que cada elemento de una lista tenga un id estable. */
+function estabilizarIds(lista) {
+  let cambio = false;
+  (lista || []).forEach(x => { if (x && !x.id) { x.id = uuid(); cambio = true; } });
+  return cambio;
+}
+
 const Nube = {
   client: null, user: null, cfg: null, sincronizando: false, ultimoError: '',
   perfil: null, preferencias: null,
 
+  /* Estado visible: local · sincronizando · sincronizado · sin_conexion · error */
+  estado: 'local',
+  ultimaSync: null,
+  cola: [],
+  canal: null,
+  recienEnviados: new Map(),
+  temporizadorBajada: null,
+  temporizadorCola: null,
+
   /* ------------------------------------------------------------ Conexión -- */
   loadCfg() { try { this.cfg = JSON.parse(localStorage.getItem(LS_SB) || 'null'); } catch (e) { this.cfg = null; } return this.cfg; },
   saveCfg(url, key) { this.cfg = { url: url.trim().replace(/\/$/, ''), key: key.trim() }; localStorage.setItem(LS_SB, JSON.stringify(this.cfg)); },
-  clearCfg() { localStorage.removeItem(LS_SB); this.cfg = null; this.client = null; this.user = null; },
+  clearCfg() {
+    this.desconectarRealtime();
+    localStorage.removeItem(LS_SB);
+    this.cfg = null; this.client = null; this.user = null; this.estado = 'local';
+  },
   get conectado() { return !!(this.client && this.user); },
   get configurado() { return !!this.client; },
+  get enLinea() { return typeof navigator === 'undefined' || navigator.onLine !== false; },
+  get pendientes() { return this.cola.length; },
+
+  /** Texto corto para la interfaz. */
+  get resumenEstado() {
+    if (!this.configurado) return { txt: 'Solo en este equipo', cls: 'neutro', ic: 'nube' };
+    if (!this.user) return { txt: 'Sin sesión', cls: 'neutro', ic: 'nube' };
+    if (!this.enLinea) return { txt: this.pendientes ? this.pendientes + ' cambio(s) por enviar' : 'Sin conexión', cls: 'aviso', ic: 'alerta' };
+    if (this.estado === 'sincronizando') return { txt: 'Sincronizando…', cls: 'activo', ic: 'refrescar' };
+    if (this.estado === 'error') return { txt: 'Error de sincronización', cls: 'critico', ic: 'alerta' };
+    if (this.pendientes) return { txt: this.pendientes + ' cambio(s) por enviar', cls: 'aviso', ic: 'nube' };
+    return { txt: this.ultimaSync ? 'Sincronizado ' + fmtHora(this.ultimaSync) : 'Sincronizado', cls: 'ok', ic: 'check' };
+  },
+
+  fijarEstado(e, error) {
+    this.estado = e;
+    this.ultimoError = error || (e === 'error' ? this.ultimoError : '');
+    if (e === 'sincronizado') { this.ultimaSync = nowNaive(); this.guardarMarca(); }
+    try { render(); } catch (x) {}
+  },
+
+  guardarMarca() { try { localStorage.setItem(LS_SYNC, JSON.stringify({ ultima: this.ultimaSync })); } catch (e) {} },
+  leerMarca() { try { this.ultimaSync = (JSON.parse(localStorage.getItem(LS_SYNC) || '{}')).ultima || null; } catch (e) { this.ultimaSync = null; } },
 
   async init() {
     this.loadCfg();
-    if (!this.cfg || !window.supabase) return false;
+    if (!this.cfg || !window.supabase) { this.estado = 'local'; return false; }
     try {
       this.client = window.supabase.createClient(this.cfg.url, this.cfg.key, {
-        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: 'pkce', storageKey: 'nexo.auth' }
+        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: 'pkce', storageKey: 'nexo.auth' },
+        realtime: { params: { eventsPerSecond: 5 } }
       });
+
+      /* Sesión guardada: se restaura antes de pintar nada definitivo. */
       const { data } = await this.client.auth.getSession();
-      this.user = data?.session?.user || null;
+      const usuario = data && data.session ? data.session.user : null;
+
       this.client.auth.onAuthStateChange((evento, sesion) => {
-        this.user = sesion?.user || null;
+        const nuevo = sesion && sesion.user ? sesion.user : null;
         if (evento === 'PASSWORD_RECOVERY') { UI.recuperandoClave = true; abrirNuevaClave(); return; }
-        if (evento === 'SIGNED_OUT') { this.perfil = null; this.preferencias = null; }
+        if (evento === 'SIGNED_OUT') { this.alSalir(); return; }
+        if (evento === 'TOKEN_REFRESHED' || evento === 'USER_UPDATED') { this.user = nuevo; return; }
+        if (nuevo && (!this.user || this.user.id !== nuevo.id)) { this.alEntrar(nuevo); return; }
+        this.user = nuevo;
         render();
       });
-      if (this.user) await this.cargarPerfil();
+
+      this.escucharEntorno();
+      if (usuario) await this.alEntrar(usuario);
       return true;
-    } catch (e) { this.ultimoError = e.message; this.client = null; return false; }
+    } catch (e) { this.ultimoError = e.message; this.client = null; this.estado = 'error'; return false; }
+  },
+
+  /* ----------------------------------------------- Entrada y salida de sesión
+     Al entrar: se cambia la caché a la de esa cuenta, se envía lo que quedó
+     pendiente y se baja todo desde Supabase.
+     Al salir: se corta Realtime y se vuelve a la caché local, sin rastros de
+     la cuenta anterior en memoria.                                           */
+  async alEntrar(usuario) {
+    this.user = usuario;
+    aplicarUsuario(usuario.id);
+    this.leerCola();
+    this.leerMarca();
+    UI.cargando = true; this.fijarEstado('sincronizando');
+    try {
+      migrarIdsAUuid();
+      await this.vaciarCola();
+
+      /* Cuenta recién creada y datos en este equipo: no se pisa nada sin
+         preguntar. Se decide una vez y después todo va solo. */
+      const vacia = await this.cuentaVacia();
+      const locales = (DB.tasks || []).length + (DB.brands || []).length + (DB.subjects || []).length;
+      if (vacia && locales > 0) {
+        await this.suscribirRealtime();
+        this.fijarEstado('sincronizado');
+        UI.cargando = false; render();
+        try { await abrirPrimeraSincronizacion(); } catch (e) {}
+        return;
+      }
+
+      await this.bajar();
+      await this.suscribirRealtime();
+      this.fijarEstado('sincronizado');
+    } catch (e) {
+      console.warn('Carga inicial', e.message);
+      this.fijarEstado(this.enLinea ? 'error' : 'sin_conexion', e.message);
+    } finally { UI.cargando = false; render(); }
+  },
+
+  /** ¿La cuenta en Supabase todavía no tiene nada? */
+  async cuentaVacia() {
+    for (const t of ['tasks', 'brands', 'courses', 'notes']) {
+      const { data, error } = await this.client.from(t).select('id').is('deleted_at', null);
+      if (error) continue;
+      if ((data || []).length) return false;
+    }
+    return true;
+  },
+
+  alSalir() {
+    this.desconectarRealtime();
+    this.user = null; this.perfil = null; this.preferencias = null;
+    this.cola = []; this.recienEnviados.clear();
+    aplicarUsuario(null);       // vuelve a la caché local: no quedan datos ajenos
+    this.estado = 'local';
+    UI.param = null;
+    render();
+  },
+
+  /** Reacciona al foco y a la vuelta de la conexión. */
+  escucharEntorno() {
+    if (this._escuchando) return;
+    this._escuchando = true;
+    window.addEventListener('online', () => {
+      this.fijarEstado(this.conectado ? 'sincronizando' : 'local');
+      this.sincronizar().catch(() => {});
+    });
+    window.addEventListener('offline', () => this.fijarEstado('sin_conexion'));
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && this.conectado) this.sincronizar().catch(() => {});
+    });
+    window.addEventListener('focus', () => { if (this.conectado && this.pendientes) this.vaciarCola().catch(() => {}); });
+    /* Red de seguridad para las tablas que no emiten en tiempo real. */
+    setInterval(() => { if (this.conectado && this.enLinea && !document.hidden) this.sincronizar().catch(() => {}); }, 5 * 60000);
   },
 
   /* ------------------------------------------------------- Autenticación -- */
@@ -654,8 +951,7 @@ const Nube = {
       options: { data: { full_name: nombre || DB.profile.nombre }, emailRedirectTo: location.href.split('#')[0] }
     });
     if (error) throw error;
-    this.user = data.user;
-    if (data.session) await this.cargarPerfil();
+    if (data.session && data.user) await this.alEntrar(data.user); else this.user = data.user;
     return { requiereConfirmacion: !data.session };
   },
 
@@ -663,12 +959,16 @@ const Nube = {
     if (!this.client) throw new Error('Primero guarda la conexión con Supabase.');
     const { data, error } = await this.client.auth.signInWithPassword({ email: email.trim().toLowerCase(), password });
     if (error) throw error;
-    this.user = data.user;
-    await this.cargarPerfil();
+    await this.alEntrar(data.user);
     return data.user;
   },
 
-  async salir() { if (this.client) await this.client.auth.signOut(); this.user = null; this.perfil = null; },
+  async salir() {
+    /* Antes de cerrar se intenta enviar lo pendiente: nada se pierde en silencio. */
+    if (this.conectado && this.enLinea && this.pendientes) { try { await this.vaciarCola(); } catch (e) {} }
+    if (this.client) await this.client.auth.signOut();
+    this.alSalir();
+  },
 
   async recuperar(email) {
     if (!this.client) throw new Error('Primero guarda la conexión con Supabase.');
@@ -728,122 +1028,295 @@ const Nube = {
     }).eq('user_id', this.user.id);
   },
 
+  /* ==========================================================================
+     COLA DE SALIDA
+     --------------------------------------------------------------------------
+     Todo cambio se guarda primero en el navegador y entra a esta cola. La cola
+     se vacía apenas hay conexión; si no la hay, espera. Nada local se descarta
+     hasta que Supabase confirma la escritura.
+
+     La cola guarda solo `{op, tabla, id}`: al enviar se lee la versión más
+     reciente que está en memoria, así diez ediciones seguidas viajan una vez.
+     ========================================================================== */
+  leerCola() {
+    try { this.cola = JSON.parse(localStorage.getItem(LS_COLA) || '[]'); }
+    catch (e) { this.cola = []; }
+    if (!Array.isArray(this.cola)) this.cola = [];
+  },
+  guardarCola() { try { localStorage.setItem(LS_COLA, JSON.stringify(this.cola)); } catch (e) {} },
+
+  /** Registra un cambio pendiente de subir. */
+  encolar(op, tabla, id, copia) {
+    if (!this.cfg || !this.user) return;          // sin cuenta no hay a dónde subir
+    const i = this.cola.findIndex(x => x.tabla === tabla && x.id === id);
+    const item = { op: op, tabla: tabla, id: id, ts: Date.now() };
+    if (op === 'delete') item.copia = copia ? JSON.parse(JSON.stringify(copia)) : null;
+    if (i >= 0) this.cola[i] = item; else this.cola.push(item);
+    this.guardarCola();
+    clearTimeout(this.temporizadorCola);
+    this.temporizadorCola = setTimeout(() => this.vaciarCola().catch(() => {}), 400);
+    try { render(); } catch (e) {}
+  },
+
+  /** Envía la cola en orden. Lo que falla se queda para el próximo intento. */
+  async vaciarCola() {
+    if (!this.conectado || !this.enLinea || this._vaciando) return;
+    if (!this.cola.length) return;
+    this._vaciando = true;
+    const antes = this.estado;
+    this.fijarEstado('sincronizando');
+    const quedan = [];
+    let fallo = null;
+    try {
+      /* Se ordena por dependencia para no chocar con las claves foráneas. */
+      const peso = t => { const i = ORDEN_SUBIDA.indexOf(t); return i < 0 ? 99 : i; };
+      const lote = this.cola.slice().sort((a, b) => (a.op === 'delete') - (b.op === 'delete') || peso(a.tabla) - peso(b.tabla));
+      for (const item of lote) {
+        try {
+          if (item.op === 'delete') {
+            await this.enviarBorrado(item.tabla, item.id, item.copia);
+            this.marcarPropio(item.id, new Date().toISOString());
+          } else {
+            const fila = store.get(item.tabla, item.id);
+            if (!fila) continue;                   // se borró después: nada que enviar
+            await this.enviarFila(item.tabla, fila);
+            this.marcarPropio(item.id, fila._editado_en || new Date().toISOString());
+          }
+        } catch (e) { fallo = e; quedan.push(item); }
+      }
+    } finally {
+      this.cola = quedan; this.guardarCola(); this._vaciando = false;
+      if (fallo) this.fijarEstado(this.enLinea ? 'error' : 'sin_conexion', fallo.message);
+      else if (antes !== 'sincronizando') this.fijarEstado('sincronizado');
+    }
+    if (fallo) throw fallo;
+  },
+
+  /**
+   * Recuerda lo que este dispositivo acaba de enviar, con su marca de tiempo.
+   * Sirve para ignorar el eco de Realtime sin descartar por error un cambio
+   * que otro dispositivo hizo sobre el mismo registro segundos después.
+   */
+  marcarPropio(id, sello) {
+    this.recienEnviados.set(id, { ts: Date.now(), sello: sello || null });
+    if (this.recienEnviados.size > 400) {
+      const corte = Date.now() - 20000;
+      this.recienEnviados.forEach((v, k) => { if (v.ts < corte) this.recienEnviados.delete(k); });
+    }
+  },
+  /** ¿Este cambio es el eco de lo que yo mismo envié? */
+  esPropio(id, remota) {
+    const e = this.recienEnviados.get(id);
+    if (!e || Date.now() - e.ts > 15000) return false;
+    if (!remota || !remota.updated_at || !e.sello) return true;
+    /* Si lo que llega es más nuevo que lo último que envié, viene de otro lado. */
+    return new Date(remota.updated_at).getTime() <= new Date(e.sello).getTime();
+  },
+
   /* ------------------------------------------------- Escritura incremental */
-  /** Envía una fila concreta. Silencioso: la copia local ya se guardó. */
-  async push(tabla, fila) {
-    if (!this.conectado || this.sincronizando) return;
-    try {
-      if (tabla === 'tasks' && fila.parent_id) return this.pushSubtarea(fila);
-      if (tabla === 'events') return this.pushEvento(fila);
-      if (tabla === 'agreements') return this.pushAcuerdo(fila);
-      if (tabla === 'flashcards') return this.pushFicha(fila);
-      const m = MAPA[tabla]; if (!m) return;
-      const payload = Object.assign(m.out(fila), { user_id: this.user.id });
-      const { error } = await this.client.from(m.remota).upsert(payload);
-      if (error) throw error;
-      if (tabla === 'tasks') await this.pushChecklist(fila);
-      if (tabla === 'evaluations') await this.pushNota(fila);
-      if (tabla === 'brands') await this.pushContactos(fila);
-    } catch (e) { console.warn('Sincronización', tabla, e.message); }
+  /** Envía una fila concreta. Lanza si falla: la cola decide qué hacer. */
+  async enviarFila(tabla, fila) {
+    if (!this.conectado) throw new Error('Sin sesión');
+    if (tabla === 'tasks' && fila.parent_id) return this.pushSubtarea(fila);
+    if (tabla === 'events') return this.pushEvento(fila);
+    if (tabla === 'agreements') return this.pushAcuerdo(fila);
+    if (tabla === 'flashcards') return this.pushFicha(fila);
+    const m = MAPA[tabla]; if (!m) return;
+    const payload = Object.assign(m.out(fila), {
+      user_id: this.user.id,
+      updated_at: fila._editado_en || tzOut(fila.updated_at) || new Date().toISOString(),
+      deleted_at: null
+    });
+    const { error } = await this.client.from(m.remota).upsert(payload);
+    if (error) throw new Error(m.remota + ': ' + error.message);
+    if (tabla === 'tasks') await this.pushChecklist(fila);
+    if (tabla === 'evaluations') await this.pushNota(fila);
+    if (tabla === 'brands') await this.pushContactos(fila);
   },
 
-  async remove(tabla, id) {
-    if (!this.conectado) return;
-    const destino = tabla === 'events' ? null : (MAPA[tabla] ? MAPA[tabla].remota : tabla);
-    try {
-      if (destino) await this.client.from(destino).delete().eq('id', id);
-      else { for (const t of ['meetings', 'class_sessions', 'personal_events']) await this.client.from(t).delete().eq('id', id); }
-    } catch (e) { console.warn(e); }
+  /** Alias histórico. Ahora todo pasa por la cola. */
+  push(tabla, fila) { this.encolar('upsert', tabla, fila && fila.id); },
+
+  /**
+   * Marca filas como borradas. `conservar` es la lista de ids que se quedan.
+   * Si la tabla todavía no tiene `deleted_at` (falta ejecutar db/05-sync.sql),
+   * cae al borrado real en vez de dejar la sincronización trabada.
+   */
+  async marcarBorrado(tabla, filtro, conservar) {
+    const sello = { deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    const armar = (base) => {
+      let q = base.eq(filtro.c, filtro.v);
+      if (conservar && conservar.length) q = q.not('id', 'in', '(' + conservar.join(',') + ')');
+      return q;
+    };
+    const { error } = await armar(this.client.from(tabla).update(sello));
+    if (!error) return;
+    if (!/deleted_at/i.test(error.message || '')) throw new Error(tabla + ': ' + error.message);
+    const r = await armar(this.client.from(tabla).delete());
+    if (r.error) throw new Error(tabla + ': ' + r.error.message);
   },
 
+  /**
+   * Borrado suave: se marca `deleted_at` en vez de eliminar la fila.
+   * Así el borrado llega a los otros dispositivos como un cambio normal y la
+   * información sigue recuperable desde Supabase si hubo un error.
+   */
+  async enviarBorrado(tabla, id, copia) {
+    if (!this.conectado) throw new Error('Sin sesión');
+    const marcar = (t, filtro) => this.marcarBorrado(t, filtro || { c: 'id', v: id });
+
+    if (tabla === 'events') {
+      const tipo = copia && copia.tipo;
+      const destinos = tipo === 'reunion' ? ['meetings'] : tipo === 'clase' ? ['class_sessions']
+        : tipo === 'personal' ? ['personal_events'] : ['meetings', 'class_sessions', 'personal_events'];
+      for (const t of destinos) await marcar(t);
+      if (!tipo || tipo === 'reunion') await marcar('meeting_participants', { c: 'meeting_id', v: id });
+      return;
+    }
+    if (tabla === 'agreements') { await marcar(copia && copia.tipo === 'incidencia' ? 'incidents' : 'agreements'); return; }
+    if (tabla === 'flashcards') { await marcar(copia && copia.tipo === 'ficha' ? 'flashcards' : 'practice_questions'); return; }
+    if (tabla === 'tasks' && copia && copia.parent_id) { await marcar('subtasks'); return; }
+    if (tabla === 'tasks') { await marcar('tasks'); await marcar('subtasks', { c: 'task_id', v: id }); return; }
+    if (tabla === 'brands') { await marcar('brands'); await marcar('contacts', { c: 'brand_id', v: id }); return; }
+    if (tabla === 'evaluations') { await marcar('assessments'); await marcar('grades', { c: 'assessment_id', v: id }); return; }
+    const m = MAPA[tabla]; if (!m) return;
+    await marcar(m.remota);
+  },
+
+  /** Alias histórico. */
+  remove(tabla, id, copia) { this.encolar('delete', tabla, id, copia); },
+
+  /**
+   * Subtareas y elementos de checklist.
+   * Se les asigna un id estable la primera vez y desde entonces se actualizan
+   * en su lugar. Antes se borraban y recreaban en cada envío, lo que producía
+   * filas nuevas cada vez y hacía imposible sincronizarlas.
+   */
   async pushChecklist(t) {
+    if (estabilizarIds(t.checklist)) saveDB();
     const hijas = store.where('tasks', x => x.parent_id === t.id);
-    const filas = (t.checklist || []).map((c, i) => ({ id: uid(), user_id: this.user.id, task_id: t.id, title: c.texto, is_done: !!c.hecho, position: i + 1 }))
-      .concat(hijas.map((h, i) => ({ id: h.id, user_id: this.user.id, task_id: t.id, title: h.titulo, is_done: h.estado === 'completada', position: 100 + i })));
-    await this.client.from('subtasks').delete().eq('task_id', t.id);
-    if (filas.length) await this.client.from('subtasks').insert(filas);
+    const filas = (t.checklist || []).filter(c => String(c.texto || '').trim()).map((c, i) => ({
+      id: c.id, user_id: this.user.id, task_id: t.id, title: c.texto, is_done: !!c.hecho,
+      position: i + 1, deleted_at: null
+    })).concat(hijas.map((h, i) => ({
+      id: h.id, user_id: this.user.id, task_id: t.id, title: h.titulo,
+      is_done: h.estado === 'completada', position: 100 + i, deleted_at: null
+    })));
+    if (filas.length) {
+      const { error } = await this.client.from('subtasks').upsert(filas);
+      if (error) throw new Error('subtasks: ' + error.message);
+    }
+    /* Lo que ya no está en la lista se marca borrado, no se elimina. */
+    await this.marcarBorrado('subtasks', { c: 'task_id', v: t.id }, filas.map(f => f.id));
   },
   async pushSubtarea(t) {
     if (!t.parent_id) return;
-    await this.client.from('subtasks').upsert({
+    const { error } = await this.client.from('subtasks').upsert({
       id: t.id, user_id: this.user.id, task_id: t.parent_id, title: t.titulo,
-      is_done: t.estado === 'completada', position: 100
+      is_done: t.estado === 'completada', position: 100, deleted_at: null
     });
+    if (error) throw new Error('subtasks: ' + error.message);
   },
   async pushNota(e) {
-    if (e.nota == null || e.nota === '') { await this.client.from('grades').delete().eq('assessment_id', e.id); return; }
-    await this.client.from('grades').upsert(
-      { user_id: this.user.id, assessment_id: e.id, score: Number(e.nota), attempt: 1 },
+    if (e.nota == null || e.nota === '') {
+      await this.marcarBorrado('grades', { c: 'assessment_id', v: e.id });
+      return;
+    }
+    const { error } = await this.client.from('grades').upsert(
+      { user_id: this.user.id, assessment_id: e.id, score: Number(e.nota), attempt: 1, deleted_at: null },
       { onConflict: 'assessment_id,attempt' }
     );
+    if (error) throw new Error('grades: ' + error.message);
   },
   async pushContactos(b) {
-    await this.client.from('contacts').delete().eq('brand_id', b.id);
+    if (estabilizarIds(b.contactos)) saveDB();
     const filas = (b.contactos || []).filter(c => c.nombre).map(c => ({
-      id: uid(), user_id: this.user.id, brand_id: b.id, full_name: c.nombre,
-      role_title: c.cargo || null, email: c.email || null, phone: c.telefono || null
+      id: c.id, user_id: this.user.id, brand_id: b.id, full_name: c.nombre,
+      role_title: c.cargo || null, email: c.email || null, phone: c.telefono || null, deleted_at: null
     }));
-    if (filas.length) await this.client.from('contacts').insert(filas);
+    if (filas.length) {
+      const { error } = await this.client.from('contacts').upsert(filas);
+      if (error) throw new Error('contacts: ' + error.message);
+    }
+    await this.marcarBorrado('contacts', { c: 'brand_id', v: b.id }, filas.map(f => f.id));
   },
   async pushEvento(ev) {
-    const base = { id: ev.id, user_id: this.user.id, title: ev.titulo };
+    const base = { id: ev.id, user_id: this.user.id, title: ev.titulo, deleted_at: null,
+      updated_at: ev._editado_en || new Date().toISOString() };
     if (ev.tipo === 'reunion') {
-      await this.client.from('meetings').upsert(Object.assign({}, base, {
+      const { error } = await this.client.from('meetings').upsert(Object.assign({}, base, {
         space: aR('area', ev.area), brand_id: ev.brand_id || null, starts_at: tzOut(ev.inicio),
         ends_at: tzOut(ev.fin), location: ev.lugar || null, link: ev.enlace || null,
         objective: ev.objetivo || null, notes: ev.notas || null,
         reminder_minutes: clamp(ev.recordatorio_min || 30, 0, 10080),
         status: ev.estado === 'realizado' ? 'done' : ev.estado === 'cancelado' ? 'cancelled' : 'scheduled'
       }));
+      if (error) throw new Error('meetings: ' + error.message);
+      if (estabilizarIds(ev.participantes)) saveDB();
       const partes = (ev.participantes || []).filter(p => p.nombre).map(p => ({
-        id: uid(), user_id: this.user.id, meeting_id: ev.id, display_name: p.nombre, role_title: p.rol || null
+        id: p.id, user_id: this.user.id, meeting_id: ev.id, display_name: p.nombre,
+        role_title: p.rol || null, deleted_at: null
       }));
-      await this.client.from('meeting_participants').delete().eq('meeting_id', ev.id);
-      if (partes.length) await this.client.from('meeting_participants').insert(partes);
+      if (partes.length) {
+        const r = await this.client.from('meeting_participants').upsert(partes);
+        if (r.error) throw new Error('meeting_participants: ' + r.error.message);
+      }
+      await this.marcarBorrado('meeting_participants', { c: 'meeting_id', v: ev.id }, partes.map(p => p.id));
     } else if (ev.tipo === 'clase' && ev.subject_id) {
-      await this.client.from('class_sessions').upsert(Object.assign({}, base, {
+      const { error } = await this.client.from('class_sessions').upsert(Object.assign({}, base, {
         course_id: ev.subject_id, starts_at: tzOut(ev.inicio), ends_at: tzOut(ev.fin),
         room: ev.lugar || null, modality: ev.enlace ? 'Online' : null, notes: ev.notas || null
       }));
+      if (error) throw new Error('class_sessions: ' + error.message);
     } else if (ev.tipo === 'personal') {
-      await this.client.from('personal_events').upsert(Object.assign({}, base, {
+      const { error } = await this.client.from('personal_events').upsert(Object.assign({}, base, {
         starts_at: tzOut(ev.inicio), ends_at: tzOut(ev.fin), location: ev.lugar || null, notes: ev.notas || null,
         reminder_minutes: clamp(ev.recordatorio_min || 30, 0, 10080)
       }));
+      if (error) throw new Error('personal_events: ' + error.message);
     }
     /* Los eventos de tipo evaluación y sesión de estudio se derivan de sus
        propias tablas, así que no se duplican aquí. */
   },
   async pushAcuerdo(a) {
-    const comun = { id: a.id, user_id: this.user.id, brand_id: a.brand_id || null, title: a.titulo, detail: a.detalle || null };
+    const comun = { id: a.id, user_id: this.user.id, brand_id: a.brand_id || null, title: a.titulo,
+      detail: a.detalle || null, deleted_at: null, updated_at: a._editado_en || new Date().toISOString() };
     if (a.tipo === 'incidencia') {
-      await this.client.from('incidents').upsert(Object.assign({}, comun, {
+      const inc = Object.assign({}, comun, {
         description: a.detalle || null, severity: a.impacto === 'alto' ? 'high' : a.impacto === 'bajo' ? 'low' : 'medium',
         status: a.estado === 'cerrado' ? 'resolved' : a.estado === 'en_curso' ? 'in_progress' : 'open',
         detected_at: tzOut(a.fecha + 'T09:00')
-      }));
-      delete comun.detail;
+      });
+      delete inc.detail;
+      const { error } = await this.client.from('incidents').upsert(inc);
+      if (error) throw new Error('incidents: ' + error.message);
     } else {
-      await this.client.from('agreements').upsert(Object.assign({}, comun, {
+      const { error } = await this.client.from('agreements').upsert(Object.assign({}, comun, {
         meeting_id: a.event_id || null, type: aR('acuerdoT', a.tipo), owner_name: a.responsable || null,
         agreed_on: soloFecha(a.fecha), status: aR('acuerdoE', a.estado), impact: aR('impacto', a.impacto || 'medio')
       }));
+      if (error) throw new Error('agreements: ' + error.message);
     }
   },
   async pushFicha(f) {
+    const sello = { deleted_at: null, updated_at: f._editado_en || new Date().toISOString() };
     if (f.tipo === 'ficha') {
-      await this.client.from('flashcards').upsert({
+      const { error } = await this.client.from('flashcards').upsert(Object.assign({
         id: f.id, user_id: this.user.id, course_id: f.subject_id || null, unit_id: f.unit_id || null,
         front: f.pregunta, back: f.respuesta, mastery: aR('dominio', f.dominio),
         hits: f.aciertos || 0, misses: f.fallos || 0,
         interval_days: clamp(f.intervalo_dias || 1, 0, 365), next_review: soloFecha(f.proxima_revision)
-      });
+      }, sello));
+      if (error) throw new Error('flashcards: ' + error.message);
     } else {
-      await this.client.from('practice_questions').upsert({
+      const { error } = await this.client.from('practice_questions').upsert(Object.assign({
         id: f.id, user_id: this.user.id, course_id: f.subject_id || null, unit_id: f.unit_id || null,
         type: aR('preguntaT', f.tipo, 'open'), prompt: f.pregunta, answer: f.respuesta || null,
-        options: (f.opciones || []).map(o => ({ text: o.texto, correct: !!o.correcta })), difficulty: 3
-      });
+        options: (f.opciones || []).map(o => ({ text: o.texto, correct: !!o.correcta })), difficulty: 3,
+        hits: f.aciertos || 0, misses: f.fallos || 0,
+        interval_days: clamp(f.intervalo_dias || 1, 0, 365), next_review: soloFecha(f.proxima_revision)
+      }, sello));
+      if (error) throw new Error('practice_questions: ' + error.message);
     }
   },
 
@@ -851,13 +1324,15 @@ const Nube = {
   async subir() {
     if (!this.conectado) throw new Error('Inicia sesión para sincronizar.');
     this.sincronizando = true;
+    this.fijarEstado('sincronizando');
     try {
       migrarIdsAUuid();
-      const orden = ['brands', 'stores', 'people', 'person_events', 'requests', 'subjects', 'units',
-        'evaluations', 'readings', 'study_plans', 'study_sessions', 'glossary', 'legal_sources',
-        'cases', 'tasks', 'notes', 'time_blocks'];
-      for (const t of orden) {
-        const filas = (DB[t] || []).filter(f => t !== 'tasks' || !f.parent_id).map(f => Object.assign(MAPA[t].out(f), { user_id: this.user.id }));
+      for (const t of ORDEN_SUBIDA) {
+        const filas = (DB[t] || []).filter(f => t !== 'tasks' || !f.parent_id).map(f => Object.assign(
+          MAPA[t].out(f),
+          { user_id: this.user.id, deleted_at: null,
+            updated_at: f._editado_en || tzOut(f.updated_at) || new Date().toISOString() }
+        ));
         for (let i = 0; i < filas.length; i += 100) {
           const { error } = await this.client.from(MAPA[t].remota).upsert(filas.slice(i, i + 100));
           if (error) throw new Error(MAPA[t].remota + ': ' + error.message);
@@ -871,13 +1346,18 @@ const Nube = {
       for (const a of DB.agreements) await this.pushAcuerdo(a);
       for (const f of DB.flashcards) await this.pushFicha(f);
       await this.guardarPerfil();
+      this.fijarEstado('sincronizado');
     } finally { this.sincronizando = false; }
   },
 
-  /* ------------------------------------------------------- Bajar todo ----- */
+  /* ------------------------------------------------------- Bajar todo -----
+     Reemplaza la caché local con lo que hay en Supabase, que es la fuente
+     principal. Lo único que sobrevive es lo que todavía no alcanzó a subir:
+     esos registros se vuelven a aplicar encima para no perder trabajo. */
   async bajar() {
     if (!this.conectado) throw new Error('Inicia sesión para sincronizar.');
     this.sincronizando = true;
+    const previo = JSON.parse(JSON.stringify(DB));      // respaldo para lo pendiente
     try {
       const traer = async (tabla, select) => {
         const { data, error } = await this.client.from(tabla).select(select || '*').is('deleted_at', null);
@@ -892,7 +1372,8 @@ const Nube = {
 
       const [brands, contacts, stores, people, peopleEv, requests, incidents, meetings, mParts, agreements,
              periods, courses, units, classes, assessments, readings, plans, sessions,
-             sources, concepts, cases, flashcards, questions, tasks, subtasks, notes, personal, blocks] =
+             sources, concepts, cases, flashcards, questions, tasks, subtasks, notes, personal, blocks,
+             apuntes, citas, intentos] =
         await Promise.all([
           traer('brands'), traer('contacts'), traer('stores'), traer('people'),
           traer('people_events'), traer('requests'), traer('incidents'),
@@ -902,7 +1383,8 @@ const Nube = {
           traer('legal_sources'), traer('legal_concepts'), traer('case_briefs'),
           traer('flashcards'), traer('practice_questions'),
           traer('tasks', '*, subtasks(*)'), traer('subtasks'), traer('notes'),
-          traer('personal_events'), traer('time_blocks')
+          traer('personal_events'), traer('time_blocks'),
+          traer('legal_notes'), traer('reading_notes'), traer('review_attempts')
         ]);
 
       const periodoDe = {}; periods.forEach(p => periodoDe[p.id] = p.name);
@@ -910,7 +1392,7 @@ const Nube = {
       DB.brands = brands.map(MAPA.brands.in_);
       DB.brands.forEach(b => {
         b.contactos = contacts.filter(c => c.brand_id === b.id)
-          .map(c => ({ nombre: c.full_name, cargo: c.role_title || '', email: c.email || '', telefono: c.phone || '' }));
+          .map(c => ({ id: c.id, nombre: c.full_name, cargo: c.role_title || '', email: c.email || '', telefono: c.phone || '' }));
       });
       DB.stores = stores.map(MAPA.stores.in_);
       DB.people = people.map(MAPA.people.in_);
@@ -946,13 +1428,23 @@ const Nube = {
         id: q.id, subject_id: q.course_id, unit_id: q.unit_id, pregunta: q.prompt, respuesta: q.answer || '',
         tipo: aL('preguntaT', q.type, 'desarrollo'),
         opciones: (q.options || []).map(o => ({ texto: o.text, correcta: !!o.correct })),
-        dominio: 'no_estudiado', aciertos: 0, fallos: 0, intervalo_dias: 1, proxima_revision: todayISO()
+        dominio: 'no_estudiado', aciertos: q.hits || 0, fallos: q.misses || 0,
+        intervalo_dias: q.interval_days || 1, proxima_revision: q.next_review || todayISO()
       })));
+
+      /* Universidad: apuntes, citas de lectura y registro de repaso */
+      DB.legal_notes = apuntes.map(MAPA.legal_notes.in_);
+      DB.reading_notes = citas.map(MAPA.reading_notes.in_);
+      DB.review_attempts = intentos.map(MAPA.review_attempts.in_);
 
       /* Tareas y subtareas */
       DB.tasks = tasks.map(MAPA.tasks.in_);
       const porTarea = {}; subtasks.forEach(s => (porTarea[s.task_id] = porTarea[s.task_id] || []).push(s));
-      DB.tasks.forEach(t => { t.checklist = (porTarea[t.id] || []).map(s => ({ texto: s.title, hecho: s.is_done })); });
+      DB.tasks.forEach(t => {
+        t.checklist = (porTarea[t.id] || []).filter(s => (s.position || 0) < 100)
+          .sort((a, b) => (a.position || 0) - (b.position || 0))
+          .map(s => ({ id: s.id, texto: s.title, hecho: s.is_done }));
+      });
 
       DB.notes = notes.map(MAPA.notes.in_);
       DB.time_blocks = blocks.map(MAPA.time_blocks.in_);
@@ -963,7 +1455,7 @@ const Nube = {
         id: m.id, area: aL('area', m.space), tipo: 'reunion', titulo: m.title, inicio: tzIn(m.starts_at),
         fin: tzIn(m.ends_at), lugar: m.location || '', enlace: m.link || '', objetivo: m.objective || '',
         notas: m.notes || '', brand_id: m.brand_id, subject_id: null,
-        participantes: (partsDe[m.id] || []).map(p => ({ nombre: p.display_name, rol: p.role_title || '' })),
+        participantes: (partsDe[m.id] || []).map(p => ({ id: p.id, nombre: p.display_name, rol: p.role_title || '' })),
         recordatorio_min: m.reminder_minutes,
         estado: m.status === 'done' ? 'realizado' : m.status === 'cancelled' ? 'cancelado' : 'programado'
       })).concat(classes.map(c => ({
@@ -981,9 +1473,140 @@ const Nube = {
         notas: '', brand_id: null, subject_id: e.subject_id, participantes: [], recordatorio_min: 60, estado: 'programado'
       })));
 
+      /* Lo que aún no subió manda sobre lo bajado: es más nuevo por definición. */
+      this.reaplicarPendientes(previo);
+
+      TABLAS.forEach(t => { if (!Array.isArray(DB[t])) DB[t] = []; });
+      DB.esDemo = false;
       await this.cargarPerfil();
       saveDB();
     } finally { this.sincronizando = false; }
+  },
+
+  /**
+   * Vuelve a poner encima los cambios que todavía están en la cola.
+   * Sin esto, bajar justo después de editar sin conexión borraría la edición.
+   */
+  reaplicarPendientes(previo) {
+    if (!this.cola.length) return;
+    this.cola.forEach(item => {
+      const t = item.tabla;
+      if (!Array.isArray(DB[t])) DB[t] = [];
+      if (item.op === 'delete') { DB[t] = DB[t].filter(r => r.id !== item.id); return; }
+      const local = (previo[t] || []).find(r => r.id === item.id);
+      if (!local) return;
+      const i = DB[t].findIndex(r => r.id === item.id);
+      if (i >= 0) DB[t][i] = local; else DB[t].push(local);
+    });
+  },
+
+  /* ==========================================================================
+     TIEMPO REAL
+     --------------------------------------------------------------------------
+     Supabase avisa de cada cambio en las tablas del usuario. El filtro
+     `user_id=eq.<tu id>` se aplica en el servidor, además de RLS: nunca llega
+     un cambio ajeno.
+
+     Los cambios de tablas simples se aplican de inmediato. Los de tablas que
+     Nexo arma juntando varias (agenda, acuerdos, fichas, subtareas) disparan
+     una bajada completa con un pequeño retardo, para no repetirla diez veces
+     seguidas cuando llegan varios cambios juntos.
+     ========================================================================== */
+  async suscribirRealtime() {
+    if (!this.conectado || !this.client.channel) return;
+    this.desconectarRealtime();
+    try {
+      const canal = this.client.channel('nexo-sync-' + this.user.id);
+      TABLAS_REALTIME.forEach(tabla => {
+        canal.on('postgres_changes',
+          { event: '*', schema: 'public', table: tabla, filter: 'user_id=eq.' + this.user.id },
+          (payload) => this.alLlegarCambio(tabla, payload));
+      });
+      canal.subscribe((estado) => {
+        if (estado === 'CHANNEL_ERROR' || estado === 'TIMED_OUT') {
+          /* Sin tiempo real la app sigue: se refresca al volver el foco. */
+          console.warn('Tiempo real no disponible; se usará el refresco por foco.');
+        }
+      });
+      this.canal = canal;
+    } catch (e) { console.warn('Realtime', e.message); }
+  },
+
+  desconectarRealtime() {
+    clearTimeout(this.temporizadorBajada);
+    if (this.canal && this.client) { try { this.client.removeChannel(this.canal); } catch (e) {} }
+    this.canal = null;
+  },
+
+  alLlegarCambio(tablaRemota, payload) {
+    const fila = payload.new && payload.new.id ? payload.new : payload.old;
+    if (!fila) return;
+    if (this.esPropio(fila.id, payload.new)) return;   // eco de este mismo dispositivo
+
+    const local = POR_REMOTA[tablaRemota];
+    const simple = local && !['tasks', 'evaluations', 'brands'].includes(local);
+
+    if (simple && payload.eventType !== 'DELETE' && payload.new) {
+      if (this.aplicarFila(local, payload.new)) { saveDB(); render(); return; }
+    }
+    this.programarBajada();
+  },
+
+  /**
+   * Aplica una fila recibida por tiempo real.
+   * Devuelve false si conviene bajar todo (por ejemplo, si el registro está
+   * en la cola de salida y no se debe pisar).
+   */
+  aplicarFila(tablaLocal, remota) {
+    if (this.cola.some(x => x.id === remota.id)) return true;   // lo mío es más nuevo
+    if (!Array.isArray(DB[tablaLocal])) DB[tablaLocal] = [];
+    const i = DB[tablaLocal].findIndex(r => r.id === remota.id);
+
+    if (remota.deleted_at) {
+      if (i >= 0) DB[tablaLocal].splice(i, 1);
+      return true;
+    }
+    let convertida;
+    try { convertida = MAPA[tablaLocal].in_(remota); } catch (e) { return false; }
+    convertida.created_at = tzIn(remota.created_at) || nowNaive();
+    convertida.updated_at = tzIn(remota.updated_at) || nowNaive();
+    convertida._editado_en = remota.updated_at || null;
+    if (i >= 0) DB[tablaLocal][i] = Object.assign({}, DB[tablaLocal][i], convertida);
+    else DB[tablaLocal].push(convertida);
+    return true;
+  },
+
+  programarBajada() {
+    clearTimeout(this.temporizadorBajada);
+    this.temporizadorBajada = setTimeout(() => {
+      if (!this.conectado || !this.enLinea || this.sincronizando) return;
+      this.fijarEstado('sincronizando');
+      this.bajar()
+        .then(() => { this.fijarEstado('sincronizado'); render(); })
+        .catch(e => this.fijarEstado('error', e.message));
+    }, 1200);
+  },
+
+  /* ---------------------------------------------------------- Sincronizar --
+     Primero se envía lo pendiente y solo después se baja. Al revés se podría
+     pisar una edición que aún no llegó a Supabase. */
+  async sincronizar(opciones) {
+    const manual = opciones && opciones.manual;
+    if (!this.conectado) { if (manual) throw new Error('Inicia sesión para sincronizar.'); return; }
+    if (!this.enLinea) { this.fijarEstado('sin_conexion'); if (manual) throw new Error('Sin conexión. Los cambios se enviarán al volver.'); return; }
+    if (this.sincronizando && !manual) return;
+    this.fijarEstado('sincronizando');
+    try {
+      await this.vaciarCola();
+      if (this.pendientes) throw new Error('Quedaron ' + this.pendientes + ' cambio(s) sin enviar.');
+      await this.bajar();
+      await this.suscribirRealtime();
+      this.fijarEstado('sincronizado');
+    } catch (e) {
+      this.fijarEstado(this.enLinea ? 'error' : 'sin_conexion', e.message);
+      if (manual) throw e;
+    }
+    render();
   },
 
   /* ---------------------------------------------------------- Utilidades -- */
@@ -1984,6 +2607,8 @@ const PATHS = {
   vacio:       '<path d="M3.5 8.5 12 4l8.5 4.5V16L12 20.5 3.5 16Z"/><path d="M3.5 8.5 12 13l8.5-4.5M12 13v7.5"/>',
   ok:          '<circle cx="12" cy="12" r="8.5"/><path d="m8.5 12.2 2.4 2.4 4.6-5"/>',
   info:        '<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.8h.01"/>',
+  nube:        '<path d="M17.5 18.5H7a4.5 4.5 0 0 1-.6-8.96A5.5 5.5 0 0 1 17.3 10.2a4.15 4.15 0 0 1 .2 8.3Z"/>',
+  refrescar:   '<path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v4.5h-4.5"/>',
   copiar:      '<rect x="8.5" y="8.5" width="12" height="12" rx="2.5"/><path d="M15.5 5.5A2 2 0 0 0 13.5 3.5h-7a3 3 0 0 0-3 3v7a2 2 0 0 0 2 2"/>',
   enviar:      '<path d="M5 12h13M13 6.5 18.5 12 13 17.5"/>',
   ajustes:     '<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>'
@@ -2019,6 +2644,48 @@ function badge(txt, cls) {
 }
 function areaDot(area) { return '<span class="inline-block w-1.5 h-1.5 rounded-full ' + (AREAS[area]?.dot || 'bg-ink-400') + '"></span>'; }
 function areaBadge(area) { const a = AREAS[area]; return badge(areaDot(area) + ' ' + esc(a.label), a.bg + ' ' + a.txt); }
+
+/* --- Estado de sincronización --------------------------------------------
+   Un solo lugar decide los colores, para que el indicador del encabezado y el
+   panel de Configuración digan siempre lo mismo.                            */
+const SYNC_CLS = {
+  ok:      'bg-okc-100 text-okc-700 dark:bg-okc-500/20 dark:text-okc-200',
+  activo:  'bg-petrol-100 text-petrol-700 dark:bg-petrol-500/25 dark:text-petrol-100',
+  aviso:   'bg-warnc-100 text-warnc-700 dark:bg-warnc-500/20 dark:text-warnc-200',
+  critico: 'bg-critc-100 text-critc-700 dark:bg-critc-500/20 dark:text-critc-200',
+  neutro:  'bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300'
+};
+
+/** Píldora compacta para el encabezado. Se oculta si no hay nada que contar. */
+function chipSync() {
+  if (!Nube.configurado || !Nube.user) return '';
+  const e = Nube.resumenEstado;
+  if (e.cls === 'ok' && !Nube.pendientes) {
+    /* Todo al día: un punto discreto, sin robar atención. */
+    return '<span class="hidden sm:inline-flex items-center gap-1.5 text-[11px] text-ink-400 dark:text-ink-500" title="' + esc(e.txt) + '">' +
+      '<span class="w-1.5 h-1.5 rounded-full bg-okc-500"></span>Sincronizado</span>';
+  }
+  return '<button type="button" data-act="sync-ahora" title="Sincronizar ahora" ' +
+    'class="inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-[3px] rounded-md leading-tight ' +
+    (SYNC_CLS[e.cls] || SYNC_CLS.neutro) + '">' +
+    ico(e.ic, 13) + '<span class="hidden sm:inline">' + esc(e.txt) + '</span></button>';
+}
+
+/** Bloque de estado dentro de Configuración → Sincronización. */
+function panelSync() {
+  const e = Nube.resumenEstado;
+  const detalle = !Nube.enLinea
+    ? 'Sin conexión. Lo que edites queda guardado aquí y se envía solo cuando vuelva internet.'
+    : Nube.estado === 'error'
+      ? 'No se pudo sincronizar: ' + esc(Nube.ultimoError || 'error desconocido') + '. Tus datos siguen guardados en este equipo.'
+      : Nube.pendientes
+        ? 'Hay cambios esperando su turno para subir. No se pierde nada.'
+        : 'Supabase tiene la última versión. Los cambios de tus otros dispositivos llegan solos.';
+  return '<div class="flex items-start gap-3 p-3 rounded-xl2 border border-ink-200 dark:border-ink-800 mb-3">' +
+    '<span class="mt-0.5 shrink-0">' + badge(ico(e.ic, 13) + esc(e.txt), SYNC_CLS[e.cls] || SYNC_CLS.neutro) + '</span>' +
+    '<p class="text-[12px] text-ink-600 dark:text-ink-300 leading-relaxed">' + detalle + '</p>' +
+    '</div>';
+}
 
 /** Estado vacío con ilustración simple, texto guía y acción sugerida. */
 function vacio(titulo, texto, accionHtml = '', icono = 'vacio') {
@@ -2376,6 +3043,7 @@ function shell(contenido) {
               '</div>' +
             '</div>' +
             '<div class="flex items-center gap-1.5 shrink-0">' +
+              chipSync() +
               '<span class="hidden sm:flex items-center gap-1.5 text-[12px] font-medium text-ink-500 dark:text-ink-400 px-2.5 py-1.5 rounded-lg bg-ink-100 dark:bg-ink-850 tnum">' +
                 ico('reloj', 14) + relojCL() + '</span>' +
               btnIco('buscar', 'buscar-global', 'Buscar en Nexo', '', 'hover:bg-ink-100 dark:hover:bg-ink-850 text-ink-500 dark:text-ink-400 md:hidden') +
@@ -2768,9 +3436,10 @@ async function sincronizar(direccion) {
   cerrarModal();
   UI.cargando = true; render();
   try {
-    if (direccion === 'subir') { await Nube.subir(); toast('Datos enviados a Supabase', 'exito'); }
-    else if (direccion === 'bajar') { await Nube.bajar(); toast('Datos descargados', 'exito'); }
-    else { const msg = await Nube.cargarDemoEnLaNube(); toast(msg || 'Datos de ejemplo cargados', 'exito'); await Nube.bajar(); }
+    if (direccion === 'subir') { await Nube.subir(); await Nube.suscribirRealtime(); toast('Datos enviados a Supabase', 'exito'); }
+    else if (direccion === 'bajar') { await Nube.bajar(); await Nube.suscribirRealtime(); Nube.fijarEstado('sincronizado'); toast('Datos descargados', 'exito'); }
+    else if (direccion === 'ahora') { await Nube.sincronizar({ manual: true }); toast('Todo al día', 'exito'); }
+    else { const msg = await Nube.cargarDemoEnLaNube(); toast(msg || 'Datos de ejemplo cargados', 'exito'); await Nube.bajar(); await Nube.suscribirRealtime(); }
   } catch (e) {
     toast(mensajeAuth(e), 'error');
   } finally {
@@ -6718,8 +7387,10 @@ Vistas.config = function () {
               btn('Cerrar sesión', 'sb-salir', '', BTN.secundario) +
             '</div>' +
             '<p class="' + LBL + '">Sincronización</p>' +
+            panelSync() +
             '<div class="flex flex-wrap gap-2 mb-3">' +
-              btn(ico('enviar', 16) + 'Subir mis datos', 'sync-subir') +
+              btn(ico('refrescar', 16) + 'Sincronizar ahora', 'sync-ahora') +
+              btn(ico('enviar', 16) + 'Subir mis datos', 'sync-subir', '', BTN.secundario) +
               btn(ico('flecha', 16) + 'Bajar de la nube', 'sync-bajar', '', BTN.secundario) +
               btn(ico('meta', 16) + 'Cargar ejemplo', 'sync-demo', '', BTN.secundario) +
             '</div>' +
@@ -6729,7 +7400,7 @@ Vistas.config = function () {
               btn('Vaciar mi cuenta en la nube', 'sb-vaciar', '', BTN.peligroSuave) +
               btn('Olvidar conexión', 'sb-olvidar', '', BTN.fantasma) +
             '</div>' +
-            '<p class="text-[11.5px] text-ink-500 dark:text-ink-400 mt-3">Cada cambio que hagas se envía solo. Los botones de arriba son para migraciones completas.</p>'
+            '<p class="text-[11.5px] text-ink-500 dark:text-ink-400 mt-3">Cada cambio se envía solo y llega a tus otros dispositivos en segundos. Sin conexión queda guardado aquí y se envía al volver: nada se borra de este equipo antes de que Supabase lo confirme.</p>'
           : '<div class="flex flex-col sm:flex-row sm:items-center gap-3 p-3.5 rounded-xl2 border border-warnc-200 dark:border-warnc-500/30 bg-warnc-50 dark:bg-warnc-500/10">' +
               '<span class="w-10 h-10 shrink-0 rounded-xl2 grid place-items-center bg-warnc-500 text-white">' + ico('persona', 20) + '</span>' +
               '<div class="min-w-0 flex-1"><p class="text-[13.5px] font-semibold text-warnc-700 dark:text-warnc-200">Conectado, sin sesión</p>' +
@@ -7966,6 +8637,9 @@ document.addEventListener('click', (ev) => {
       confirmar('Se cargarán datos de ejemplo en tu cuenta de Supabase y se descargarán a este navegador.', () => sincronizar('demo'),
         { tono: 'info', ok: 'Cargar ejemplo' });
       break;
+    case 'sync-ahora':
+      sincronizar('ahora');
+      break;
 
     /* --- datos --- */
     case 'exportar': {
@@ -8054,32 +8728,50 @@ window.addEventListener('hashchange', () => { parseHash(); render(); window.scro
    24. ARRANQUE
    ========================================================================== */
 /* Service worker: solo tiene sentido servido por http/https, no con file:// */
+/* --------------------------------------------------------------------------
+   Service worker.
+   Se registra y, si hay una versión nueva esperando, se activa de inmediato:
+   así nunca queda una copia vieja de la aplicación atrapada en la caché.
+   -------------------------------------------------------------------------- */
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js').catch(() => {
+    navigator.serviceWorker.register('sw.js').then(reg => {
+      /* Busca actualizaciones al abrir y cada media hora. */
+      reg.update().catch(() => {});
+      setInterval(() => reg.update().catch(() => {}), 30 * 60000);
+
+      reg.addEventListener('updatefound', () => {
+        const nuevo = reg.installing;
+        if (!nuevo) return;
+        nuevo.addEventListener('statechange', () => {
+          if (nuevo.state === 'installed' && navigator.serviceWorker.controller) {
+            nuevo.postMessage({ type: 'ACTIVAR_YA' });
+          }
+        });
+      });
+    }).catch(() => {
       /* Sin service worker la app sigue funcionando; solo pierde el modo sin conexión. */
+    });
+
+    let recargando = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (recargando) return;
+      recargando = true;
+      location.reload();
     });
   });
 }
 
 (async function init() {
-  loadLocal();
+  loadLocal(null);
   cargarHistorial();
   if (!UI.tema) UI.tema = DB.profile.tema || 'claro';
   parseHash();
   render();
   try {
+    /* `Nube.init()` restaura la sesión guardada y, si la hay, cambia a la
+       caché de esa cuenta, envía lo pendiente, baja todo y abre Realtime. */
     await Nube.init();
-    if (Nube.conectado && DB.esDemo) {
-      /* Lo local todavía es el ejemplo: la nube manda. Si la cuenta está
-         vacía, se conserva el ejemplo hasta que decidas qué hacer. */
-      UI.cargando = true; render();
-      try {
-        const { count } = await Nube.client.from('tasks').select('id', { count: 'exact', head: true });
-        if ((count || 0) > 0) { await Nube.bajar(); DB.esDemo = false; saveDB(); }
-      } catch (e) { console.warn('Sincronización inicial', e.message); }
-      UI.cargando = false;
-    }
     render();
   } catch (e) { console.warn('Supabase no disponible:', e.message); }
   // Reloj: actualiza el encabezado cada minuto sin redibujar toda la app

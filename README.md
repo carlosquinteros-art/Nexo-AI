@@ -2,12 +2,31 @@
 
 Asistente personal de Carlos Quinteros: coordinación de Trade Marketing, carrera de Derecho y vida personal en un solo lugar.
 
-Dos formas de usarlo:
+Publicado en **https://nexo-asistente.pages.dev**
 
 | | Qué es | Cuándo usarlo |
 |---|---|---|
-| **`nexo.html`** | Prototipo completo en un solo archivo. Abre con doble clic y funciona. | Uso diario hoy |
-| **`app/`** | Proyecto Vite + React + TypeScript con la capa de datos tipada. | Base para la versión desplegada |
+| **`nexo.html`** | La aplicación completa en un solo archivo. Es la fuente. | Lo que editas |
+| **`site/index.html`** | Copia idéntica de `nexo.html`. Es lo que publica Cloudflare Pages. | No lo edites a mano |
+| **`app/`** | Proyecto Vite + React + TypeScript con la capa de datos tipada. | Base para una versión futura |
+
+> Después de cambiar `nexo.html`, copia el resultado: `cp nexo.html site/index.html`. Los dos archivos deben quedar idénticos (`diff nexo.html site/index.html` no debe mostrar nada).
+
+---
+
+## Cómo funciona la sincronización
+
+**Supabase es la fuente principal.** El navegador guarda una copia de trabajo, no la verdad.
+
+1. **Al abrir**, Nexo restaura tu sesión y descarga todo lo de tu cuenta.
+2. **Al editar**, el cambio se guarda al instante en el equipo y entra a una cola de salida. La cola se vacía sola en menos de un segundo.
+3. **Tus otros dispositivos** reciben el cambio por Supabase Realtime, filtrado por tu `user_id`. Los cambios simples se aplican solos; los que Nexo arma juntando varias tablas (agenda, acuerdos, fichas) disparan una recarga con 1,2 s de retardo para no repetirla muchas veces seguidas.
+4. **Sin conexión** todo sigue funcionando. Lo que edites queda en la cola y se envía cuando vuelve internet. **Nada local se descarta hasta que Supabase confirma la escritura.**
+5. **Si dos dispositivos editan lo mismo**, gana la edición más reciente: cada cambio viaja con el instante exacto en que lo hiciste y la base descarta las escrituras que llegan con fecha más antigua.
+6. **La caché está separada por cuenta** (`nexo.db.v1::<tu id>`). Al cerrar sesión se limpia de memoria y no queda nada de una cuenta visible en otra.
+7. **Como red de seguridad**, Nexo también se refresca al volver el foco a la pestaña, al recuperar la conexión, cada 5 minutos y con el botón **Sincronizar ahora** (Configuración → Sincronización, o la píldora de estado del encabezado).
+
+El encabezado muestra siempre en qué estado estás: *Sincronizado*, *Sincronizando*, *N cambios por enviar*, *Sin conexión* o *Error de sincronización*.
 
 ---
 
@@ -46,10 +65,13 @@ SQL Editor → New query → pegar el contenido completo de cada archivo → **R
 
 | Orden | Archivo | Qué hace | Obligatorio |
 |---|---|---|---|
-| 1 | `db/01-schema.sql` | 40 tablas, enums, RLS, vistas | Sí |
+| 1 | `db/01-schema.sql` | 44 tablas, enums, RLS, vistas | Sí |
 | 2 | `db/03-universidad.sql` | Módulo académico: preparación, lecturas, apuntes, repaso | Sí |
 | 3 | `db/04-auditoria.sql` | Validaciones, índices y función de auditoría | Sí |
-| 4 | `db/02-seed.sql` | Crea las funciones de datos de ejemplo | Opcional |
+| 4 | **`db/05-sync.sql`** | **Sincronización entre dispositivos: borrado suave, Realtime, última modificación válida** | **Sí** |
+| 5 | `db/02-seed.sql` | Crea las funciones de datos de ejemplo | Opcional |
+
+> **`05-sync.sql` es indispensable.** Sin ella los cambios no viajan entre tu computador y tu celular: faltan las columnas de borrado suave, la publicación de Realtime y la regla que decide qué edición gana. Es idempotente y no toca ningún dato existente.
 
 > **Importante sobre el paso 2.** `03-universidad.sql` contiene un `ALTER TYPE ... ADD VALUE`, que PostgreSQL no admite dentro de una transacción. Si el editor te devuelve *"cannot run inside a transaction block"*, ejecuta **solo esa línea** por separado y luego el resto del archivo:
 >
@@ -61,9 +83,12 @@ SQL Editor → New query → pegar el contenido completo de cada archivo → **R
 
 ```sql
 select * from public.auditar_seguridad();
+select * from public.auditar_sincronizacion();
 ```
 
-Las seis filas deben decir `OK`. Si alguna dice `FALLA`, vuelve a ejecutar `01-schema.sql` completo.
+Todas las filas deben decir `OK`. Si alguna dice `FALLA`, vuelve a ejecutar el archivo correspondiente completo.
+
+También conviene revisar **Database → Replication** en el panel de Supabase: la publicación `supabase_realtime` debe listar unas 32 tablas.
 
 Conteo rápido:
 
@@ -140,53 +165,46 @@ npm run check       # typecheck + lint + build, todo junto
 
 ## 4. Publicar en Cloudflare Pages
 
-### 4.1 Subir el repositorio
+El sitio en producción sale de la carpeta **`site/`**, no de `app/`.
+
+### 4.1 Publicar un cambio
 
 ```bash
 cd "ruta/a/Nexo"
-git init
-git add .
-git commit -m "Nexo: primera versión"
-git branch -M main
-git remote add origin https://github.com/TU-USUARIO/nexo.git
-git push -u origin main
+cp nexo.html site/index.html          # obligatorio: los dos deben ser idénticos
+diff nexo.html site/index.html        # no debe imprimir nada
+git add -A
+git commit -m "Describe el cambio"
+git push origin HEAD:main
 ```
 
-`app/.gitignore` ya excluye `node_modules/`, `dist/` y cualquier `.env`.
+Cloudflare despliega solo al recibir el push. El `.gitignore` de la raíz ya excluye `node_modules/`, `dist/`, `.DS_Store`, `*.tsbuildinfo` y cualquier `.env`.
 
-### 4.2 Crear el proyecto en Cloudflare
+### 4.2 Configuración del proyecto en Cloudflare
 
-Cloudflare Dashboard → **Workers & Pages** → **Create** → **Pages** → **Connect to Git**.
+Cloudflare Dashboard → **Workers & Pages** → tu proyecto → **Settings → Builds & deployments**.
 
 | Campo | Valor |
 |---|---|
-| Framework preset | `Vite` |
-| Build command | `npm run build` |
-| Build output directory | `dist` |
-| Root directory | `app` |
-| Node version | `20` (variable `NODE_VERSION = 20`) |
+| Build command | *(vacío)* |
+| Build output directory | `site` |
+| Root directory | `/` |
 
-**Settings → Environment variables**, para *Production* y *Preview*:
+No hacen falta variables de entorno: la URL y la anon key se pegan una vez desde la propia aplicación (**Configuración → Conectar Supabase**) y quedan guardadas en tu navegador.
+
+Recuerda tener la URL de producción en las *Redirect URLs* de Supabase (paso 2.4):
 
 ```
-VITE_SUPABASE_URL         = https://xxxxxxxx.supabase.co
-VITE_SUPABASE_ANON_KEY    = eyJhbGciOi...
-VITE_AUTH_REDIRECT_URL    = https://nexo.tudominio.com
-NODE_VERSION              = 20
+https://nexo-asistente.pages.dev/**
 ```
 
-Al terminar el despliegue, agrega la URL de Cloudflare a las *Redirect URLs* de Supabase (paso 2.4).
+### 4.3 Si prefieres desplegar la versión React de `app/`
 
-`app/public/_headers` y `app/public/_redirects` ya vienen configurados: cabeceras de seguridad, caché de assets y ruteo de una sola página.
+Es otro proyecto de Pages, con *Root directory* `app`, *Build command* `npm run build` y *Build output* `dist`, más las variables `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_AUTH_REDIRECT_URL` y `NODE_VERSION=20`. `app/public/_headers` y `app/public/_redirects` ya vienen configurados.
 
-### 4.3 Desplegar desde la terminal (alternativa)
+### 4.4 Cuando publiques una versión nueva
 
-```bash
-npm install -g wrangler
-cd app
-npm run build
-wrangler pages deploy dist --project-name nexo
-```
+El service worker está versionado (`VERSION` en `sw.js`). El HTML se sirve con «red primero», así que un cambio se ve al recargar. Si alguna vez cambias mucho el service worker, sube ese número para forzar el borrado de las cachés viejas.
 
 ### 4.4 Edge Function del asistente (opcional)
 
@@ -266,6 +284,24 @@ Marca cada una. Toma unos 20 minutos.
 ### Datos
 29. Configuración → Exportar respaldo → se descarga un JSON con todo.
 30. Importar ese mismo JSON en otro navegador → los datos aparecen.
+
+### Sincronización entre dispositivos
+
+Estas son las importantes. Abre `https://nexo-asistente.pages.dev` en dos navegadores con la misma cuenta (por ejemplo Chrome en el computador y el celular, o una ventana normal y otra de incógnito).
+
+31. **Crear**: crea una tarea en el navegador A. En menos de 3 segundos aparece en el B, sin recargar.
+32. **Editar**: cámbiale el título desde el B. El A se actualiza solo.
+33. **Borrar**: bórrala desde el A. Desaparece del B.
+34. **Recargar**: recarga el B con `F5`. Todo sigue igual.
+35. **Cerrar y abrir**: cierra el navegador por completo, vuelve a entrar. La sesión y los datos siguen.
+36. **Los tres espacios**: repite 31 a 33 con una asignatura (Universidad) y una nota personal.
+37. **Universidad completa**: crea un apunte jurídico y una cita de lectura en el A → aparecen en el B con el texto original intacto.
+38. **Aislamiento**: entra con una segunda cuenta en otro navegador. No debe ver **nada** de la primera. Vuelve a la primera: todo sigue ahí.
+39. **Sin conexión**: en el A activa el modo avión (o DevTools → Network → Offline). Crea dos tareas. El encabezado dice *«2 cambios por enviar»* y las tareas se ven igual. Vuelve a conectar → se envían solas y aparecen en el B.
+40. **Cerrar sesión**: cierra sesión en el A. Debe quedar sin datos de la cuenta a la vista. Vuelve a entrar → todo regresa.
+41. **Consola limpia**: abre DevTools → Console. No debe haber errores en rojo durante todo lo anterior.
+
+Si algo de 31 a 33 no funciona, casi siempre es que falta ejecutar `db/05-sync.sql`. Compruébalo con `select * from public.auditar_sincronizacion();`.
 
 ---
 

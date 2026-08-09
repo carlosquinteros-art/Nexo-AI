@@ -1,0 +1,30 @@
+# Dependencias y compilados
+node_modules/
+dist/
+build/
+.vite/
+*.tsbuildinfo
+
+# Variables de entorno: nunca al repositorio
+.env
+.env.*
+!.env.example
+
+# Sistema operativo y editores
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/
+
+# Registros y temporales
+*.log
+npm-debug.log*
+yarn-error.log*
+.cache/
+tmp/
+
+# Supabase local
+supabase/.branches/
+supabase/.temp/

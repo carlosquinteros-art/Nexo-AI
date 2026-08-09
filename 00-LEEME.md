@@ -23,6 +23,7 @@ Nexo/
 │   ├── 02-seed.sql                 Datos de ejemplo opcionales
 │   ├── 03-universidad.sql          Migración del módulo académico
 │   ├── 04-auditoria.sql            Validaciones, índices y auditar_seguridad()
+│   ├── 05-sync.sql                 Sincronización: borrado suave, Realtime, LWW
 │   └── README-SUPABASE.md          Instrucciones paso a paso
 │
 ├── supabase/functions/nexo-ai/     Edge Function: IA con la clave en el servidor
@@ -67,10 +68,11 @@ Sigue `db/README-SUPABASE.md`. Resumen:
 2. SQL Editor → pegar y ejecutar `db/01-schema.sql`.
 3. Ejecutar `db/03-universidad.sql` (migración del módulo académico).
 4. Ejecutar `db/04-auditoria.sql` (validaciones e índices).
-5. (Opcional) ejecutar `db/02-seed.sql` para habilitar la carga de ejemplos.
-6. Verificar con `select * from public.auditar_seguridad();` → las seis filas deben decir `OK`.
-7. En Nexo: **Configuración → Cuenta y sincronización → Conectar Supabase**, pegar *Project URL* y *anon public key*.
-8. **Crear cuenta** con tu correo → Nexo pregunta con qué datos partir:
+5. Ejecutar `db/05-sync.sql` (**indispensable** para que los datos viajen entre dispositivos).
+6. (Opcional) ejecutar `db/02-seed.sql` para habilitar la carga de ejemplos.
+7. Verificar con `select * from public.auditar_seguridad();` y `select * from public.auditar_sincronizacion();` → todas las filas deben decir `OK`.
+8. En Nexo: **Configuración → Cuenta y sincronización → Conectar Supabase**, pegar *Project URL* y *anon public key*.
+9. **Crear cuenta** con tu correo → Nexo pregunta con qué datos partir:
    - *Usar mis datos de la nube* (si ya tienes)
    - *Subir lo que tengo en este equipo* (la primera migración)
    - *Cargar datos de ejemplo en la nube*
