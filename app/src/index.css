@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Tokens de color. El acento cambia con el espacio activo. */
+:root {
+  color-scheme: light;
+  --acc: #0d5c63;
+  --acc-600: #0a4b51;
+  --surface: #ffffff;
+  --page: #f4f6f9;
+  --line: #e4e8ee;
+}
+html.dark {
+  color-scheme: dark;
+  --surface: #131820;
+  --page: #0b0f15;
+  --line: #232a36;
+}
+html[data-space='work'] { --acc: #0d5c63; --acc-600: #0a4b51; }
+html[data-space='university'] { --acc: #4f46e5; --acc-600: #4038c4; }
+html[data-space='personal'] { --acc: #0f9d75; --acc-600: #0c7f5f; }
+html[data-space='todo'] { --acc: #0d5c63; --acc-600: #0a4b51; }
+html.dark[data-space='work'] { --acc: #3d8d96; }
+html.dark[data-space='university'] { --acc: #7666df; }
+html.dark[data-space='personal'] { --acc: #3ab484; }
+html.dark[data-space='todo'] { --acc: #3d8d96; }
+
+body {
+  background: var(--page);
+  letter-spacing: -0.005em;
+}
+
+@layer components {
+  .surface {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 1.125rem;
+  }
+}
+
+/* Accesibilidad */
+:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
+  border-radius: 0.5rem;
+}
+input,
+select,
+textarea {
+  font-size: 16px;
+}
+@media (min-width: 768px) {
+  input,
+  select,
+  textarea {
+    font-size: 14px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
