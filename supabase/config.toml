@@ -1,0 +1,37 @@
+# Configuración local de Supabase para Nexo.
+#
+# Lo único crítico de este archivo: `google-oauth-callback` NO valida JWT.
+# Tiene que ser así porque a esa dirección llega el navegador siguiendo un
+# redirect de Google, sin cabecera Authorization. La identidad se recupera del
+# `state`, que se generó con tu sesión y se guardó en el esquema privado.
+#
+# Todas las demás funciones exigen sesión válida.
+
+project_id = "nexo"
+
+[functions.google-oauth-start]
+verify_jwt = true
+
+[functions.google-oauth-callback]
+verify_jwt = false
+
+[functions.google-refresh-token]
+verify_jwt = true
+
+[functions.google-sync]
+verify_jwt = true
+
+[functions.google-calendar-sync]
+verify_jwt = true
+
+[functions.google-drive-sync]
+verify_jwt = true
+
+[functions.google-disconnect]
+verify_jwt = true
+
+[functions.google-email-detail]
+verify_jwt = true
+
+[functions.nexo-ai]
+verify_jwt = true

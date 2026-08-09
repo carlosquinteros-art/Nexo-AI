@@ -69,9 +69,12 @@ SQL Editor → New query → pegar el contenido completo de cada archivo → **R
 | 2 | `db/03-universidad.sql` | Módulo académico: preparación, lecturas, apuntes, repaso | Sí |
 | 3 | `db/04-auditoria.sql` | Validaciones, índices y función de auditoría | Sí |
 | 4 | **`db/05-sync.sql`** | **Sincronización entre dispositivos: borrado suave, Realtime, última modificación válida** | **Sí** |
-| 5 | `db/02-seed.sql` | Crea las funciones de datos de ejemplo | Opcional |
+| 5 | `db/06-google-integrations.sql` | Cuentas de Google: conexiones, correos, eventos, archivos y motor de urgencia | Solo si conectas Google |
+| 6 | `db/02-seed.sql` | Crea las funciones de datos de ejemplo | Opcional |
 
 > **`05-sync.sql` es indispensable.** Sin ella los cambios no viajan entre tu computador y tu celular: faltan las columnas de borrado suave, la publicación de Realtime y la regla que decide qué edición gana. Es idempotente y no toca ningún dato existente.
+
+> **`06-google-integrations.sql`** crea el esquema `private`, donde viven los tokens de Google cifrados y fuera del alcance del navegador. Después de ejecutarla: `select public.instalar_reglas_urgencia();`. La guía completa está en **`GOOGLE_SETUP.md`**.
 
 > **Importante sobre el paso 2.** `03-universidad.sql` contiene un `ALTER TYPE ... ADD VALUE`, que PostgreSQL no admite dentro de una transacción. Si el editor te devuelve *"cannot run inside a transaction block"*, ejecuta **solo esa línea** por separado y luego el resto del archivo:
 >
@@ -84,11 +87,14 @@ SQL Editor → New query → pegar el contenido completo de cada archivo → **R
 ```sql
 select * from public.auditar_seguridad();
 select * from public.auditar_sincronizacion();
+select * from public.auditar_google();       -- solo si ejecutaste la 06
 ```
 
 Todas las filas deben decir `OK`. Si alguna dice `FALLA`, vuelve a ejecutar el archivo correspondiente completo.
 
-También conviene revisar **Database → Replication** en el panel de Supabase: la publicación `supabase_realtime` debe listar unas 32 tablas.
+También conviene revisar **Database → Replication** en el panel de Supabase: la publicación `supabase_realtime` debe listar unas 39 tablas.
+
+**Comprobación crítica si usas Google.** En **Settings → API → Exposed schemas** debe decir únicamente `public, graphql_public`. Si aparece `private`, quítalo: ese esquema guarda los tokens de Google y no debe ser accesible desde ninguna URL.
 
 Conteo rápido:
 
@@ -303,6 +309,22 @@ Estas son las importantes. Abre `https://nexo-asistente.pages.dev` en dos navega
 
 Si algo de 31 a 33 no funciona, casi siempre es que falta ejecutar `db/05-sync.sql`. Compruébalo con `select * from public.auditar_sincronizacion();`.
 
+### Cuentas de Google
+
+Requieren haber seguido `GOOGLE_SETUP.md` completo.
+
+42. **Conectar**: Configuración → Cuentas conectadas → conectar la cuenta de trabajo y la de la universidad. Aparecen las dos, con su color.
+43. **Separación**: los correos de trabajo salen en el espacio Trabajo y los de la universidad en Universidad. Nada se mezcla.
+44. **Sincronizar**: «Sincronizar ahora» trae correos y eventos de ambas.
+45. **Conflicto**: si tienes dos eventos que se pisan, aparecen en «Conflictos de agenda».
+46. **Urgencia explicada**: abre un correo de la bandeja prioritaria. Debe decir *por qué* está ahí, citando su texto y con el puntaje.
+47. **Confirmación**: una tarea sugerida **no se crea sola**. Solo aparece como tarea después de pulsar «Crear tarea» y aceptar el formulario.
+48. **Sin duplicados**: vuelve a sincronizar. La misma sugerencia no se repite.
+49. **Revocar**: desconecta una cuenta. Deja de sincronizar y, en [myaccount.google.com/connections](https://myaccount.google.com/connections), Nexo ya no aparece.
+50. **Aislamiento**: con la segunda cuenta de Nexo, no debe verse ninguna cuenta de Google de la primera.
+51. **Sin tokens**: DevTools → Application → Local Storage y la pestaña Network. Busca `access_token`, `refresh_token`, `ya29.` o `GOCSPX-`. **No debe haber nada.**
+52. **Bloqueo corporativo**: si la cuenta del trabajo falla con `admin_policy_enforced`, Nexo abre una explicación con el texto exacto para pedirle la autorización a tu administrador.
+
 ---
 
 ## 7. Comprobaciones automáticas
@@ -373,7 +395,9 @@ Con honestidad, para que no te lleves sorpresas:
 | Función | Estado |
 |---|---|
 | Notificaciones push al teléfono | No implementadas. Requieren un servidor con claves VAPID. |
-| Sincronización con Google Calendar | No implementada. Requiere OAuth con backend. |
+| Enviar, responder o borrar correos | No implementado a propósito. Los permisos de Google son de solo lectura. |
+| Crear o modificar eventos y archivos | No implementado a propósito. |
+| Sincronización de Google en segundo plano | Nexo sincroniza al abrir y con el botón. Para que corra sola con la app cerrada hay que programar un cron en Supabase que llame a `google-sync`. |
 | Importar desde BUK, GeoVictoria o Excel | No implementada. |
 | Búsqueda jurídica automática | No existe API pública estable de BCN ni del Poder Judicial. Nexo guarda enlaces y exige verificación manual. |
 | IA en el asistente | La Edge Function está escrita pero **no probada contra el modelo real**. Hay que desplegarla para saberlo. |

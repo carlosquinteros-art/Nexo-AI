@@ -9,6 +9,7 @@ Asistente personal de Carlos Quinteros para trabajo (Trade Marketing), universid
 ```
 Nexo/
 ├── README.md                       Instalación, migraciones, despliegue y pruebas
+├── GOOGLE_SETUP.md                 Conectar Gmail, Calendar y Drive paso a paso
 ├── AUDITORIA.md                    Auditoría previa a publicar: hallazgos y límites
 ├── 00-LEEME.md                     Este documento (guía funcional)
 ├── 01-Analisis-y-Arquitectura.md   Producto, arquitectura, pantallas, MVP vs V2
@@ -24,10 +25,18 @@ Nexo/
 │   ├── 03-universidad.sql          Migración del módulo académico
 │   ├── 04-auditoria.sql            Validaciones, índices y auditar_seguridad()
 │   ├── 05-sync.sql                 Sincronización: borrado suave, Realtime, LWW
+│   ├── 06-google-integrations.sql  Cuentas Google: tokens cifrados, correos, agenda
 │   └── README-SUPABASE.md          Instrucciones paso a paso
 │
-├── supabase/functions/nexo-ai/     Edge Function: IA con la clave en el servidor
-│   └── index.ts
+├── supabase/
+│   ├── config.toml                 verify_jwt por función
+│   └── functions/
+│       ├── _shared/                cifrado, Google, detección, sugerencias
+│       ├── google-oauth-start/     · google-oauth-callback/
+│       ├── google-refresh-token/   · google-sync/
+│       ├── google-calendar-sync/   · google-drive-sync/
+│       ├── google-disconnect/      · google-email-detail/
+│       └── nexo-ai/                IA con la clave en el servidor
 │
 └── app/                            Proyecto Vite + React + TypeScript
     ├── package.json · tsconfig.json · vite.config.ts

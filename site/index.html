@@ -360,7 +360,40 @@ const ESTADO_SOLICITUD = {
 const TABLAS = ['brands','stores','people','person_events','requests','agreements','subjects','units','evaluations',
                 'readings','glossary','legal_sources','cases','flashcards','study_plans','study_sessions',
                 'tasks','events','notes','time_blocks',
-                /* Universidad */ 'legal_notes','reading_notes','review_attempts'];
+                /* Universidad */ 'legal_notes','reading_notes','review_attempts',
+                /* Cuentas Google */ 'google_connections','google_messages','google_calendar_events',
+                'google_drive_items','suggested_actions','urgency_rules','priority_senders'];
+
+/* Estas tablas las escribe el servidor durante la sincronización con Google.
+   La aplicación las lee, y solo modifica lo que tú puedes decidir: el tipo y
+   el color de una cuenta, si está en pausa, el espacio de un archivo y qué
+   haces con una sugerencia. */
+const TABLAS_SOLO_LECTURA = ['google_messages', 'google_calendar_events'];
+
+const TIPO_CUENTA_GOOGLE = {
+  trabajo:     { label: 'Trabajo',     cls: 'bg-petrol-100 text-petrol-700 dark:bg-petrol-500/25 dark:text-petrol-100', color: '#0D5C63' },
+  universidad: { label: 'Universidad', cls: 'bg-uni-50 text-uni-700 dark:bg-uni-500/20 dark:text-uni-100',              color: '#4F46E5' },
+  personal:    { label: 'Personal',    cls: 'bg-okc-100 text-okc-700 dark:bg-okc-500/20 dark:text-okc-200',            color: '#0F7A4A' }
+};
+const ESTADO_CUENTA_GOOGLE = {
+  activa:      { label: 'Activa',                cls: 'bg-okc-100 text-okc-700 dark:bg-okc-500/20 dark:text-okc-200', ic: 'ok' },
+  pausada:     { label: 'En pausa',              cls: 'bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300',     ic: 'reloj' },
+  reconectar:  { label: 'Reconexión requerida',  cls: 'bg-warnc-100 text-warnc-700 dark:bg-warnc-500/20 dark:text-warnc-200', ic: 'alerta' },
+  desconectada:{ label: 'Desconectada',          cls: 'bg-ink-100 text-ink-500 dark:bg-ink-850 dark:text-ink-400',     ic: 'cerrar' },
+  error:       { label: 'Bloqueada',             cls: 'bg-critc-100 text-critc-700 dark:bg-critc-500/20 dark:text-critc-200', ic: 'alerta' }
+};
+const CATEGORIA_CORREO = {
+  urgente:     { label: 'Urgente',     cls: 'bg-critc-100 text-critc-700 dark:bg-critc-500/20 dark:text-critc-200', orden: 0 },
+  importante:  { label: 'Importante',  cls: 'bg-warnc-100 text-warnc-700 dark:bg-warnc-500/20 dark:text-warnc-200', orden: 1 },
+  en_espera:   { label: 'En espera',   cls: 'bg-petrol-100 text-petrol-700 dark:bg-petrol-500/25 dark:text-petrol-100', orden: 2 },
+  informativo: { label: 'Informativo', cls: 'bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300', orden: 3 },
+  sin_accion:  { label: 'Sin acción',  cls: 'bg-ink-50 text-ink-500 dark:bg-ink-850 dark:text-ink-400', orden: 4 }
+};
+const SERVICIOS_GOOGLE = {
+  gmail:    { label: 'Gmail',    ic: 'notas',    detalle: 'Remitente, asunto, fecha y etiquetas. No se guarda el cuerpo del mensaje.' },
+  calendar: { label: 'Calendar', ic: 'agenda',   detalle: 'Eventos de tus calendarios, solo lectura.' },
+  drive:    { label: 'Drive',    ic: 'libro',    detalle: 'Nombre, tipo y fecha de los archivos. Nunca se descarga el contenido.' }
+};
 
 /* ==========================================================================
    3. ESTADO Y PERSISTENCIA
@@ -525,7 +558,13 @@ const E = {
   concentracion:{ baja: 'low', media: 'medium', alta: 'high' },
   resultadoS:   { pendiente: 'pending', completada: 'completed', parcial: 'partial', interrumpida: 'interrupted' },
   repaso:       { correcto: 'correct', incorrecto: 'incorrect', parcial: 'partial', omitido: 'skipped' },
-  itemRepaso:   { flashcard: 'flashcard', practice_question: 'practice_question', case_brief: 'case_brief' }
+  itemRepaso:   { flashcard: 'flashcard', practice_question: 'practice_question', case_brief: 'case_brief' },
+  cuentaG:      { trabajo: 'work', universidad: 'university', personal: 'personal' },
+  estadoG:      { activa: 'active', pausada: 'paused', reconectar: 'reauth_required', desconectada: 'revoked', error: 'error' },
+  categoria:    { urgente: 'urgent', importante: 'important', en_espera: 'waiting', informativo: 'informative', sin_accion: 'no_action' },
+  sugerenciaE:  { pendiente: 'pending', aceptada: 'accepted', descartada: 'dismissed', vencida: 'expired' },
+  sugerenciaT:  { tarea: 'task', responder: 'reply', preparar: 'meeting_prep', plazo: 'deadline', documento: 'document', evento: 'event' },
+  origenDrive:  { reciente: 'recent', enlazado: 'linked', elegido: 'selected' }
 };
 const EI = {}; for (const k in E) EI[k] = inv(E[k]);
 const aR = (dic, v, def) => E[dic][v] || def || Object.values(E[dic])[0];
@@ -729,6 +768,100 @@ const MAPA = {
       subject_id: r.course_id, unit_id: r.unit_id, resultado: aL('repaso', r.result),
       segundos: r.seconds, respondida_en: tzIn(r.answered_at) }) },
 
+  /* --- Cuentas de Google -------------------------------------------------
+     Lo que llega desde Gmail, Calendar y Drive. La aplicación lo lee; quien
+     lo escribe es la sincronización del servidor. Aquí no hay ni un token:
+     esos viven cifrados en un esquema privado al que el navegador no llega. */
+  google_connections: { remota: 'google_connections',
+    out: c => ({ id: c.id, google_sub: c.google_sub, email: c.email, display_name: c.nombre || null,
+      avatar_url: c.avatar || null, account_type: aR('cuentaG', c.tipo), color: c.color || '#0D5C63',
+      status: aR('estadoG', c.estado), gmail_enabled: !!c.gmail, calendar_enabled: !!c.calendar,
+      drive_enabled: !!c.drive, scopes: c.scopes || [], is_demo: !!c.es_demo }),
+    in_: r => ({ id: r.id, google_sub: r.google_sub, email: r.email, nombre: r.display_name || r.email,
+      avatar: r.avatar_url || '', tipo: aL('cuentaG', r.account_type), color: r.color,
+      estado: aL('estadoG', r.status), gmail: !!r.gmail_enabled, calendar: !!r.calendar_enabled,
+      drive: !!r.drive_enabled, scopes: r.scopes || [], ultima_sync: tzIn(r.last_sync_at),
+      error_codigo: r.last_error_code || '', error: r.last_error || '', es_demo: !!r.is_demo }) },
+
+  google_messages: { remota: 'google_messages',
+    out: m => ({ id: m.id, connection_id: m.connection_id, external_id: m.external_id,
+      thread_id: m.thread_id || null, from_name: m.remitente || null, from_email: m.remitente_email || null,
+      to_emails: m.para || [], cc_emails: m.copia || [], subject: m.asunto,
+      sent_at: tzOut(m.fecha), labels: m.etiquetas || [], is_unread: !!m.no_leido,
+      is_important: !!m.importante, is_starred: !!m.destacado, snippet: (m.resumen || '').slice(0, 300),
+      web_link: m.enlace || null, detected: m.detecciones || [],
+      category_manual: m.categoria_manual ? aR('categoria', m.categoria_manual) : null,
+      space: aR('area', m.area), answered_at: tzOut(m.respondido_en), is_demo: !!m.es_demo }),
+    in_: r => ({ id: r.id, connection_id: r.connection_id, external_id: r.external_id,
+      thread_id: r.thread_id, remitente: r.from_name || r.from_email || '', remitente_email: r.from_email || '',
+      para: r.to_emails || [], copia: r.cc_emails || [], asunto: r.subject || '(sin asunto)',
+      fecha: tzIn(r.sent_at), etiquetas: r.labels || [], no_leido: !!r.is_unread,
+      importante: !!r.is_important, destacado: !!r.is_starred, resumen: r.snippet || '',
+      enlace: r.web_link || '', detecciones: r.detected || [],
+      categoria_manual: r.category_manual ? aL('categoria', r.category_manual) : null,
+      area: aL('area', r.space), respondido_en: tzIn(r.answered_at), es_demo: !!r.is_demo }) },
+
+  google_calendar_events: { remota: 'google_calendar_events',
+    out: e => ({ id: e.id, connection_id: e.connection_id, calendar_id: e.calendar_id || 'primary',
+      calendar_name: e.calendario || null, external_id: e.external_id, title: e.titulo,
+      description: (e.descripcion || '').slice(0, 1000) || null, location: e.lugar || null,
+      meeting_link: e.enlace_reunion || null, starts_at: tzOut(e.inicio), ends_at: tzOut(e.fin),
+      all_day: !!e.todo_el_dia, organizer_email: e.organizador || null, attendees: e.asistentes || [],
+      attendees_count: (e.asistentes || []).length, event_status: e.estado_evento || 'confirmed',
+      web_link: e.enlace || null, color: e.color || null, space: aR('area', e.area),
+      needs_prep: !!e.preparar, is_demo: !!e.es_demo }),
+    in_: r => ({ id: r.id, connection_id: r.connection_id, calendar_id: r.calendar_id,
+      calendario: r.calendar_name || '', external_id: r.external_id, titulo: r.title || '(sin título)',
+      descripcion: r.description || '', lugar: r.location || '', enlace_reunion: r.meeting_link || '',
+      inicio: tzIn(r.starts_at), fin: tzIn(r.ends_at), todo_el_dia: !!r.all_day,
+      organizador: r.organizer_email || '', asistentes: r.attendees || [],
+      estado_evento: r.event_status || 'confirmed', enlace: r.web_link || '', color: r.color || '',
+      area: aL('area', r.space), preparar: !!r.needs_prep, es_demo: !!r.is_demo }) },
+
+  google_drive_items: { remota: 'google_drive_items',
+    out: d => ({ id: d.id, connection_id: d.connection_id, external_id: d.external_id, name: d.nombre,
+      mime_type: d.tipo || null, icon_link: d.icono || null, web_link: d.enlace || null,
+      owner_email: d.dueno || null, modified_at: tzOut(d.modificado), size_bytes: d.bytes || null,
+      parent_id: d.carpeta_id || null, parent_name: d.carpeta || null,
+      origin: aR('origenDrive', d.origen || 'reciente'), space: aR('area', d.area),
+      is_selected: !!d.elegido, is_demo: !!d.es_demo }),
+    in_: r => ({ id: r.id, connection_id: r.connection_id, external_id: r.external_id, nombre: r.name,
+      tipo: r.mime_type || '', icono: r.icon_link || '', enlace: r.web_link || '',
+      dueno: r.owner_email || '', modificado: tzIn(r.modified_at), bytes: r.size_bytes,
+      carpeta_id: r.parent_id, carpeta: r.parent_name || '', origen: aL('origenDrive', r.origin),
+      area: aL('area', r.space), elegido: !!r.is_selected, es_demo: !!r.is_demo }) },
+
+  suggested_actions: { remota: 'suggested_actions',
+    out: s => ({ id: s.id, dedupe_key: s.clave, kind: aR('sugerenciaT', s.tipo),
+      status: aR('sugerenciaE', s.estado), source_type: s.origen_tipo || 'message',
+      source_id: s.origen_id || null, source_external_id: s.origen_externo || null,
+      connection_id: s.connection_id || null, title: s.titulo, detail: s.detalle || null,
+      reason: s.motivo || null, reasons: s.motivos || [], due_at: tzOut(s.vence),
+      space: aR('area', s.area), priority: aR('prioridad', s.prioridad),
+      confidence: clamp(Number(s.confianza) || 50, 0, 100),
+      created_task_id: s.task_id || null, decided_at: tzOut(s.decidido_en), is_demo: !!s.es_demo }),
+    in_: r => ({ id: r.id, clave: r.dedupe_key, tipo: aL('sugerenciaT', r.kind),
+      estado: aL('sugerenciaE', r.status), origen_tipo: r.source_type, origen_id: r.source_id,
+      origen_externo: r.source_external_id, connection_id: r.connection_id, titulo: r.title,
+      detalle: r.detail || '', motivo: r.reason || '', motivos: r.reasons || [],
+      vence: tzIn(r.due_at), area: aL('area', r.space), prioridad: aL('prioridad', r.priority),
+      confianza: r.confidence, task_id: r.created_task_id, decidido_en: tzIn(r.decided_at),
+      es_demo: !!r.is_demo }) },
+
+  urgency_rules: { remota: 'urgency_rules',
+    out: u => ({ id: u.id, code: u.codigo, label: u.etiqueta, description: u.descripcion || null,
+      enabled: u.activa !== false, weight: clamp(Number(u.peso) || 10, 0, 100), params: u.params || {},
+      applies_to: u.aplica_a || 'message', position: u.orden || 100 }),
+    in_: r => ({ id: r.id, codigo: r.code, etiqueta: r.label, descripcion: r.description || '',
+      activa: r.enabled !== false, peso: Number(r.weight), params: r.params || {},
+      aplica_a: r.applies_to, orden: r.position }) },
+
+  priority_senders: { remota: 'priority_senders',
+    out: p => ({ id: p.id, email: String(p.email || '').toLowerCase(), label: p.etiqueta || null,
+      space: aR('area', p.area), weight: clamp(Number(p.peso) || 25, 0, 100) }),
+    in_: r => ({ id: r.id, email: r.email, etiqueta: r.label || '', area: aL('area', r.space),
+      peso: Number(r.weight) }) },
+
   time_blocks: { remota: 'time_blocks',
     out: b => ({ id: b.id, space: aR('area', b.area), title: b.titulo, block_date: soloFecha(b.fecha),
       start_time: b.hora_inicio + ':00', end_time: b.hora_fin + ':00',
@@ -770,7 +903,8 @@ TABLAS_MAPEADAS.forEach(t => { POR_REMOTA[MAPA[t].remota] = t; });
 /* Orden de subida: primero los padres, después lo que los referencia. */
 const ORDEN_SUBIDA = ['brands', 'stores', 'people', 'person_events', 'requests', 'subjects', 'units',
   'evaluations', 'readings', 'study_plans', 'study_sessions', 'glossary', 'legal_sources', 'cases',
-  'legal_notes', 'reading_notes', 'review_attempts', 'tasks', 'notes', 'time_blocks'];
+  'legal_notes', 'reading_notes', 'review_attempts', 'tasks', 'notes', 'time_blocks',
+  'urgency_rules', 'priority_senders', 'suggested_actions'];
 
 /* Tablas remotas que Nexo escucha en tiempo real. Las que no están en el mapa
    directo (contactos, subtareas, notas, reuniones…) obligan a una bajada
@@ -779,7 +913,9 @@ const TABLAS_REALTIME = ['brands', 'contacts', 'stores', 'people', 'people_event
   'meetings', 'meeting_participants', 'agreements', 'courses', 'course_units', 'class_sessions',
   'assessments', 'grades', 'readings', 'study_plans', 'study_sessions', 'legal_sources', 'legal_concepts',
   'legal_notes', 'flashcards', 'practice_questions', 'case_briefs', 'tasks', 'subtasks', 'notes',
-  'personal_events', 'time_blocks', 'reading_notes', 'review_attempts', 'user_settings'];
+  'personal_events', 'time_blocks', 'reading_notes', 'review_attempts', 'user_settings',
+  'google_connections', 'google_messages', 'google_calendar_events', 'google_drive_items',
+  'suggested_actions', 'urgency_rules', 'priority_senders'];
 
 /** Puente entre `store` y la nube que no depende del orden de declaración. */
 function encolarCambio(op, tabla, id, copia) {
@@ -1048,6 +1184,9 @@ const Nube = {
   /** Registra un cambio pendiente de subir. */
   encolar(op, tabla, id, copia) {
     if (!this.cfg || !this.user) return;          // sin cuenta no hay a dónde subir
+    /* Los correos y los eventos de Google los escribe la sincronización del
+       servidor. Si la aplicación los subiera, pisaría lo que Google mandó. */
+    if (TABLAS_SOLO_LECTURA.includes(tabla)) return;
     const i = this.cola.findIndex(x => x.tabla === tabla && x.id === id);
     const item = { op: op, tabla: tabla, id: id, ts: Date.now() };
     if (op === 'delete') item.copia = copia ? JSON.parse(JSON.stringify(copia)) : null;
@@ -1328,7 +1467,12 @@ const Nube = {
     try {
       migrarIdsAUuid();
       for (const t of ORDEN_SUBIDA) {
-        const filas = (DB[t] || []).filter(f => t !== 'tasks' || !f.parent_id).map(f => Object.assign(
+        const filas = (DB[t] || [])
+          .filter(f => t !== 'tasks' || !f.parent_id)
+          /* Los ejemplos de las cuentas de Google se quedan en este equipo:
+             no tiene sentido llenar tu cuenta real con datos de muestra. */
+          .filter(f => !f.es_demo || !['suggested_actions', 'priority_senders'].includes(t))
+          .map(f => Object.assign(
           MAPA[t].out(f),
           { user_id: this.user.id, deleted_at: null,
             updated_at: f._editado_en || tzOut(f.updated_at) || new Date().toISOString() }
@@ -1386,6 +1530,30 @@ const Nube = {
           traer('personal_events'), traer('time_blocks'),
           traer('legal_notes'), traer('reading_notes'), traer('review_attempts')
         ]);
+
+      /* Cuentas de Google. Se traen aparte y con tolerancia a que las tablas
+         todavía no existan: así la aplicación sigue funcionando si aún no
+         ejecutaste db/06-google-integrations.sql. */
+      const traerG = async (tabla) => {
+        try { return await traer(tabla); }
+        catch (e) {
+          if (/does not exist|schema cache|relation/i.test(e.message || '')) return null;
+          throw e;
+        }
+      };
+      const [conexiones, correos, eventosG, archivosG, sugerencias, reglas, remitentes] = await Promise.all([
+        traerG('google_connections'), traerG('google_messages'), traerG('google_calendar_events'),
+        traerG('google_drive_items'), traerG('suggested_actions'), traerG('urgency_rules'),
+        traerG('priority_senders')
+      ]);
+      if (conexiones) DB.google_connections = conexiones.map(MAPA.google_connections.in_);
+      if (correos) DB.google_messages = correos.map(MAPA.google_messages.in_);
+      if (eventosG) DB.google_calendar_events = eventosG.map(MAPA.google_calendar_events.in_);
+      if (archivosG) DB.google_drive_items = archivosG.map(MAPA.google_drive_items.in_);
+      if (sugerencias) DB.suggested_actions = sugerencias.map(MAPA.suggested_actions.in_);
+      if (reglas) DB.urgency_rules = reglas.map(MAPA.urgency_rules.in_);
+      if (remitentes) DB.priority_senders = remitentes.map(MAPA.priority_senders.in_);
+      this.googleDisponible = conexiones !== null;
 
       const periodoDe = {}; periods.forEach(p => periodoDe[p.id] = p.name);
 
@@ -1653,6 +1821,425 @@ const Nube = {
 
 /* Alias histórico: el resto de la app sigue usando `Cloud`. */
 const Cloud = Nube;
+
+/* ==========================================================================
+   4.b CUENTAS DE GOOGLE
+   --------------------------------------------------------------------------
+   Este módulo NO habla con Google. Habla con las Edge Functions de Supabase,
+   que son las que tienen el secreto de cliente y los tokens.
+
+   Lo que el navegador ve, en total: el correo de la cuenta, su tipo, sus
+   permisos y la fecha de la última sincronización. Ningún token, ni de acceso
+   ni de renovación, pasa jamás por acá ni queda en el almacenamiento local.
+
+   Todo lo que hace es de solo lectura sobre Gmail, Calendar y Drive. Las
+   únicas escrituras son en Nexo: aceptar una sugerencia, pausar una cuenta.
+   ========================================================================== */
+const Google = {
+  ventana: null,
+  sincronizando: false,
+
+  get disponible() { return Nube.conectado; },
+  get conexiones() { return store.all('google_connections').filter(c => c.estado !== 'desconectada'); },
+  get activas() { return this.conexiones.filter(c => c.estado === 'activa'); },
+
+  /** Llama a una Edge Function con la sesión del usuario. */
+  async llamar(funcion, cuerpo) {
+    if (!Nube.conectado) throw new Error('Inicia sesión en Nexo antes de conectar Google.');
+    const { data, error } = await Nube.client.functions.invoke(funcion, { body: cuerpo || {} });
+    if (error) {
+      /* El cuerpo del error trae el código y la ayuda que preparó el servidor. */
+      let detalle = null;
+      try { detalle = await error.context?.json?.(); } catch (e) {}
+      const err = new Error(detalle?.mensaje || error.message || 'No se pudo completar la operación.');
+      err.codigo = detalle?.error || 'error_funcion';
+      err.ayuda = detalle?.ayuda || '';
+      throw err;
+    }
+    if (data && data.error) {
+      const err = new Error(data.mensaje || 'No se pudo completar la operación.');
+      err.codigo = data.error; err.ayuda = data.ayuda || '';
+      throw err;
+    }
+    return data;
+  },
+
+  /**
+   * Abre el consentimiento de Google en una ventana aparte.
+   * La ventana vuelve a una Edge Function, no a Nexo: el código de
+   * autorización nunca toca esta página.
+   */
+  async conectar(tipo, servicios, opciones) {
+    const datos = await this.llamar('google-oauth-start', {
+      tipo: E.cuentaG[tipo] ? tipo === 'trabajo' ? 'work' : tipo === 'universidad' ? 'university' : 'personal' : 'work',
+      servicios: servicios,
+      cuerpoGmail: !!(opciones && opciones.cuerpoGmail),
+      archivosDrive: !!(opciones && opciones.archivosDrive),
+      sugerir_correo: opciones && opciones.correo ? opciones.correo : undefined
+    });
+    if (!datos || !datos.url) throw new Error('El servidor no devolvió la dirección de autorización.');
+
+    const ancho = 520, alto = 680;
+    const x = Math.max(0, (screen.width - ancho) / 2), y = Math.max(0, (screen.height - alto) / 2);
+    this.ventana = window.open(datos.url, 'nexo-google',
+      'width=' + ancho + ',height=' + alto + ',left=' + x + ',top=' + y + ',menubar=no,toolbar=no');
+    if (!this.ventana) {
+      throw new Error('El navegador bloqueó la ventana emergente. Permítela para este sitio y vuelve a intentarlo.');
+    }
+    return new Promise((resolve) => {
+      const alMensaje = (ev) => {
+        const d = ev.data;
+        if (!d || d.fuente !== 'nexo-google') return;
+        window.removeEventListener('message', alMensaje);
+        clearInterval(vigilante);
+        resolve(d);
+      };
+      window.addEventListener('message', alMensaje);
+      /* Si cierras la ventana sin autorizar, no se queda esperando para siempre. */
+      const vigilante = setInterval(() => {
+        if (this.ventana && this.ventana.closed) {
+          clearInterval(vigilante);
+          window.removeEventListener('message', alMensaje);
+          resolve({ ok: false, error: 'ventana_cerrada' });
+        }
+      }, 700);
+    });
+  },
+
+  async sincronizar(connectionId, origen) {
+    if (this.sincronizando) return null;
+    this.sincronizando = true;
+    try {
+      const r = await this.llamar('google-sync', {
+        connection_id: connectionId || undefined,
+        origen: origen || 'manual'
+      });
+      /* Lo que trajo el servidor se baja como cualquier otro dato. */
+      await Nube.bajar();
+      return r;
+    } finally { this.sincronizando = false; }
+  },
+
+  async pausar(id, pausar) {
+    store.update('google_connections', id, { estado: pausar ? 'pausada' : 'activa' });
+  },
+
+  async desconectar(id, borrarDatos) {
+    const r = await this.llamar('google-disconnect', { connection_id: id, borrar_datos: !!borrarDatos });
+    /* La conexión y sus datos se quitan también de la copia local. */
+    if (borrarDatos) {
+      ['google_messages', 'google_calendar_events', 'google_drive_items'].forEach(t => {
+        DB[t] = (DB[t] || []).filter(x => x.connection_id !== id);
+      });
+      DB.suggested_actions = (DB.suggested_actions || [])
+        .filter(s => s.connection_id !== id || s.estado !== 'pendiente');
+      DB.google_connections = (DB.google_connections || []).filter(c => c.id !== id);
+    } else {
+      const c = store.get('google_connections', id);
+      if (c) Object.assign(c, { estado: 'desconectada', gmail: false, calendar: false, drive: false, scopes: [] });
+    }
+    saveDB();
+    return r;
+  },
+
+  async revisar(id) { return this.llamar('google-refresh-token', { connection_id: id }); },
+
+  async detalleCorreo(connectionId, externalId) {
+    return this.llamar('google-email-detail', { connection_id: connectionId, external_id: externalId });
+  },
+
+  cuentaDe(connectionId) { return store.get('google_connections', connectionId); },
+
+  colorDe(connectionId) {
+    const c = this.cuentaDe(connectionId);
+    return (c && c.color) || '#0D5C63';
+  }
+};
+
+/* ==========================================================================
+   4.c MOTOR DE URGENCIA
+   --------------------------------------------------------------------------
+   Determinístico y explicable, a propósito.
+
+   Cada regla suma puntos y deja escrito por qué los sumó, citando el texto
+   exacto del correo o del evento. Nada sale de una caja negra y nada se
+   inventa: si una fecha no está escrita en la fuente, para el motor no existe.
+
+   El puntaje se traduce a cinco niveles:
+     70 o más → Urgente        · 40 a 69 → Importante
+     20 a 39  → En espera      · 1 a 19  → Informativo
+     0        → Sin acción
+   ========================================================================== */
+const Urgencia = {
+  UMBRALES: { urgente: 70, importante: 40, en_espera: 20 },
+
+  /** Reglas del usuario, o las de fábrica si todavía no se han cargado. */
+  reglas(aplicaA) {
+    const propias = store.all('urgency_rules').filter(r => r.activa !== false);
+    const base = propias.length ? propias : this.PORDEFECTO;
+    return base.filter(r => r.aplica_a === 'both' || r.aplica_a === aplicaA);
+  },
+
+  regla(codigo) {
+    return store.all('urgency_rules').find(r => r.codigo === codigo && r.activa !== false)
+      || this.PORDEFECTO.find(r => r.codigo === codigo);
+  },
+
+  /* Copia local de las reglas de fábrica. Coincide con lo que instala
+     `instalar_reglas_urgencia()` en la base. */
+  PORDEFECTO: [
+    { codigo: 'plazo_24h', etiqueta: 'Vence en menos de 24 horas', peso: 40, aplica_a: 'both', params: { horas: 24 }, activa: true },
+    { codigo: 'plazo_48h', etiqueta: 'Vence en menos de 48 horas', peso: 25, aplica_a: 'both', params: { horas: 48 }, activa: true },
+    { codigo: 'palabras_urgencia', etiqueta: 'Dice que es urgente', peso: 25, aplica_a: 'message', activa: true,
+      params: { palabras: ['urgente', 'hoy mismo', 'antes de', 'último plazo', 'ultimo plazo', 'plazo máximo',
+        'a más tardar', 'a mas tardar', 'necesito respuesta', 'respuesta hoy', 'para hoy', 'cuanto antes',
+        'lo antes posible', 'impostergable', 'pendiente'] } },
+    { codigo: 'remitente_prioritario', etiqueta: 'Viene de alguien prioritario', peso: 25, aplica_a: 'message', params: {}, activa: true },
+    { codigo: 'sin_responder', etiqueta: 'Lleva días sin respuesta', peso: 20, aplica_a: 'message', params: { dias: 3 }, activa: true },
+    { codigo: 'evento_sin_preparar', etiqueta: 'Reunión próxima sin preparación', peso: 20, aplica_a: 'event', params: { horas: 24 }, activa: true },
+    { codigo: 'conflicto_agenda', etiqueta: 'Choque de horario', peso: 30, aplica_a: 'event', params: {}, activa: true },
+    { codigo: 'traslado_insuficiente', etiqueta: 'Traslado imposible', peso: 25, aplica_a: 'event', params: { minutos: 30 }, activa: true },
+    { codigo: 'solicitud_directa', etiqueta: 'Te piden algo directamente', peso: 20, aplica_a: 'message', params: {}, activa: true },
+    { codigo: 'incidencia_operacional', etiqueta: 'Incidencia en tienda', peso: 30, aplica_a: 'message', activa: true,
+      params: { palabras: ['quiebre', 'sin stock', 'sin cobertura', 'no llegó', 'no llego', 'falta personal',
+        'reclamo', 'caída', 'caida', 'sin promotor', 'cerrada'] } },
+    { codigo: 'evaluacion_proxima', etiqueta: 'Evaluación o entrega cerca', peso: 35, aplica_a: 'both', params: { dias: 3 }, activa: true },
+    { codigo: 'pago_remuneracion', etiqueta: 'Pagos o remuneraciones', peso: 20, aplica_a: 'message', activa: true,
+      params: { palabras: ['pago', 'liquidación', 'liquidacion', 'remuneración', 'remuneracion', 'boleta',
+        'factura', 'transferencia', 'finiquito'] } },
+    { codigo: 'contrato_documento', etiqueta: 'Contratos y documentos por firmar', peso: 20, aplica_a: 'message', activa: true,
+      params: { palabras: ['contrato', 'anexo', 'firma', 'firmar', 'buk', 'documento pendiente'] } },
+    { codigo: 'aprobacion_pendiente', etiqueta: 'Aprobación pendiente', peso: 20, aplica_a: 'message', activa: true,
+      params: { palabras: ['aprobación', 'aprobacion', 'aprobar', 'visto bueno', 'confirmar', 'validar', 'autorizar'] } }
+  ],
+
+  /** Busca una palabra de la regla y devuelve la que encontró, para citarla. */
+  buscarPalabra(texto, regla) {
+    const t = slug(texto);
+    for (const p of (regla.params && regla.params.palabras) || []) {
+      if (t.includes(slug(p))) return p;
+    }
+    return null;
+  },
+
+  /**
+   * Evalúa un correo. Devuelve puntaje, categoría y la lista de motivos.
+   * Cada motivo cita la evidencia: nunca hay una alerta sin explicación.
+   */
+  correo(m) {
+    const motivos = [];
+    let puntos = 0;
+    const sumar = (regla, texto, evidencia) => {
+      if (!regla || regla.activa === false) return;
+      puntos += Number(regla.peso) || 0;
+      motivos.push({ codigo: regla.codigo, texto: texto, evidencia: evidencia || '', puntos: Number(regla.peso) || 0 });
+    };
+
+    const asunto = m.asunto || '';
+    const resumen = m.resumen || '';
+    const completo = asunto + ' · ' + resumen;
+    const detecciones = m.detecciones || [];
+    const ahora = Date.now();
+
+    /* --- Fechas límite: solo las que venían escritas en el correo --- */
+    const conFecha = detecciones.find(d => d.fecha);
+    if (conFecha) {
+      const faltan = (new Date(conFecha.fecha).getTime() - ahora) / 3600000;
+      if (faltan >= 0 && faltan <= 24) {
+        sumar(this.regla('plazo_24h'), 'Vence dentro de 24 horas', conFecha.evidencia || '');
+      } else if (faltan > 24 && faltan <= 48) {
+        sumar(this.regla('plazo_48h'), 'Vence dentro de 48 horas', conFecha.evidencia || '');
+      }
+    }
+
+    /* --- Palabras que indican urgencia --- */
+    for (const codigo of ['palabras_urgencia', 'incidencia_operacional', 'pago_remuneracion',
+      'contrato_documento', 'aprobacion_pendiente']) {
+      const r = this.regla(codigo);
+      if (!r) continue;
+      const hallada = this.buscarPalabra(completo, r);
+      if (hallada) sumar(r, r.etiqueta, 'dice «' + hallada + '»');
+    }
+
+    /* --- Remitente prioritario --- */
+    const prio = store.all('priority_senders')
+      .find(p => p.email && m.remitente_email && p.email.toLowerCase() === m.remitente_email.toLowerCase());
+    if (prio) {
+      const r = this.regla('remitente_prioritario');
+      if (r) {
+        puntos += Number(prio.peso) || Number(r.peso) || 0;
+        motivos.push({ codigo: r.codigo, texto: 'Remitente prioritario',
+          evidencia: prio.etiqueta || m.remitente_email, puntos: Number(prio.peso) || Number(r.peso) || 0 });
+      }
+    }
+
+    /* --- Te piden algo y todavía no respondes --- */
+    const solicitud = detecciones.find(d => d.tipo === 'solicitud');
+    if (solicitud) sumar(this.regla('solicitud_directa'), 'Contiene una petición directa', solicitud.evidencia);
+
+    if (!m.respondido_en && m.fecha) {
+      const r = this.regla('sin_responder');
+      const dias = (r && r.params && r.params.dias) || 3;
+      const transcurridos = Math.floor((ahora - parseNaive(m.fecha).getTime()) / 86400000);
+      if (transcurridos >= dias && (solicitud || m.no_leido)) {
+        sumar(r, 'Sin responder hace ' + transcurridos + ' día(s)', 'recibido el ' + fmtFecha(m.fecha));
+      }
+    }
+
+    /* --- Universidad: evaluación o entrega cercana --- */
+    const academico = detecciones.find(d => ['evaluacion', 'entrega'].includes(d.tipo));
+    if (academico) {
+      const r = this.regla('evaluacion_proxima');
+      const dias = (r && r.params && r.params.dias) || 3;
+      const fecha = academico.fecha || (conFecha && conFecha.fecha);
+      if (fecha) {
+        const faltan = (new Date(fecha).getTime() - ahora) / 86400000;
+        if (faltan >= 0 && faltan <= dias) sumar(r, 'Evaluación o entrega en ' + Math.ceil(faltan) + ' día(s)', academico.evidencia);
+      } else {
+        sumar(r, r ? r.etiqueta : 'Evaluación mencionada', academico.evidencia);
+      }
+    }
+
+    /* Un correo ya respondido baja de golpe: la acción ya se hizo. */
+    if (m.respondido_en) puntos = Math.round(puntos / 3);
+
+    return this.componer(puntos, motivos, m.categoria_manual);
+  },
+
+  /** Evalúa un evento de calendario, con sus conflictos y traslados. */
+  evento(e, todos) {
+    const motivos = [];
+    let puntos = 0;
+    const sumar = (regla, texto, evidencia) => {
+      if (!regla || regla.activa === false) return;
+      puntos += Number(regla.peso) || 0;
+      motivos.push({ codigo: regla.codigo, texto: texto, evidencia: evidencia || '', puntos: Number(regla.peso) || 0 });
+    };
+    if (!e.inicio) return this.componer(0, motivos);
+
+    const ahora = Date.now();
+    const inicio = parseNaive(e.inicio).getTime();
+    const faltanH = (inicio - ahora) / 3600000;
+
+    if (faltanH >= 0 && faltanH <= 24) {
+      sumar(this.regla('plazo_24h'), 'Empieza en menos de 24 horas', fmtFechaHora(e.inicio));
+    } else if (faltanH > 24 && faltanH <= 48) {
+      sumar(this.regla('plazo_48h'), 'Empieza en menos de 48 horas', fmtFechaHora(e.inicio));
+    }
+
+    if (e.preparar && faltanH >= 0) {
+      const r = this.regla('evento_sin_preparar');
+      const horas = (r && r.params && r.params.horas) || 24;
+      const hayTareas = store.all('tasks').some(t => t.estado !== 'completada' &&
+        slug(t.titulo || '').includes(slug((e.titulo || '').slice(0, 18))));
+      if (faltanH <= horas && !hayTareas) {
+        sumar(r, 'Pide preparación y no hay ninguna tarea asociada', (e.descripcion || '').slice(0, 70));
+      }
+    }
+
+    const choque = this.choqueDe(e, todos);
+    if (choque) sumar(this.regla('conflicto_agenda'), 'Se pisa con «' + choque.titulo + '»', fmtHora(choque.inicio));
+
+    const traslado = this.trasladoImposible(e, todos);
+    if (traslado) {
+      sumar(this.regla('traslado_insuficiente'),
+        'Solo ' + traslado.minutos + ' min entre dos lugares distintos',
+        traslado.desde + ' → ' + traslado.hasta);
+    }
+
+    return this.componer(puntos, motivos);
+  },
+
+  /** Primer evento que se solapa con este. */
+  choqueDe(e, todos) {
+    if (!e.inicio || !e.fin || e.todo_el_dia) return null;
+    const a1 = parseNaive(e.inicio).getTime(), a2 = parseNaive(e.fin).getTime();
+    return (todos || store.all('google_calendar_events')).find(o => {
+      if (o.id === e.id || !o.inicio || !o.fin || o.todo_el_dia) return false;
+      if (o.estado_evento === 'cancelled') return false;
+      const b1 = parseNaive(o.inicio).getTime(), b2 = parseNaive(o.fin).getTime();
+      return a1 < b2 && b1 < a2;
+    }) || null;
+  },
+
+  /** Dos eventos presenciales seguidos, en lugares distintos y sin tiempo. */
+  trasladoImposible(e, todos) {
+    if (!e.fin || !e.lugar || e.enlace_reunion) return null;
+    const r = this.regla('traslado_insuficiente');
+    const minimo = (r && r.params && r.params.minutos) || 30;
+    const fin = parseNaive(e.fin).getTime();
+    for (const o of (todos || store.all('google_calendar_events'))) {
+      if (o.id === e.id || !o.inicio || !o.lugar || o.enlace_reunion) continue;
+      if (slug(o.lugar) === slug(e.lugar)) continue;
+      const ini = parseNaive(o.inicio).getTime();
+      const minutos = Math.round((ini - fin) / 60000);
+      if (minutos >= 0 && minutos < minimo) {
+        return { minutos: minutos, desde: e.lugar, hasta: o.lugar, evento: o };
+      }
+    }
+    return null;
+  },
+
+  componer(puntos, motivos, manual) {
+    let categoria = 'sin_accion';
+    if (puntos >= this.UMBRALES.urgente) categoria = 'urgente';
+    else if (puntos >= this.UMBRALES.importante) categoria = 'importante';
+    else if (puntos >= this.UMBRALES.en_espera) categoria = 'en_espera';
+    else if (puntos > 0) categoria = 'informativo';
+    return {
+      puntos: puntos,
+      categoria: manual || categoria,
+      manual: !!manual,
+      motivos: motivos.sort((a, b) => b.puntos - a.puntos)
+    };
+  },
+
+  /** Bandeja priorizada del espacio activo. */
+  bandeja(limite) {
+    return store.all('google_messages')
+      .filter(m => Q.enEspacio({ area: m.area }))
+      .map(m => Object.assign({ m: m }, this.correo(m)))
+      .filter(x => x.categoria !== 'sin_accion')
+      .sort((a, b) => (CATEGORIA_CORREO[a.categoria].orden - CATEGORIA_CORREO[b.categoria].orden) ||
+        (b.puntos - a.puntos) ||
+        (String(b.m.fecha || '') > String(a.m.fecha || '') ? 1 : -1))
+      .slice(0, limite || 8);
+  },
+
+  /** Correos donde te piden algo y todavía no respondes. */
+  sinResponder(limite) {
+    return store.all('google_messages')
+      .filter(m => !m.respondido_en && Q.enEspacio({ area: m.area }) &&
+        (m.detecciones || []).some(d => ['solicitud', 'aprobacion', 'documento'].includes(d.tipo)))
+      .sort((a, b) => (String(a.fecha || '') > String(b.fecha || '') ? 1 : -1))
+      .slice(0, limite || 5);
+  },
+
+  /** Todos los choques de horario, sin repetir el par. */
+  conflictos() {
+    const eventos = store.all('google_calendar_events')
+      .filter(e => e.estado_evento !== 'cancelled' && !e.todo_el_dia && e.inicio && e.fin);
+    const salida = [];
+    const vistos = new Set();
+    for (const a of eventos) {
+      const b = this.choqueDe(a, eventos);
+      if (!b) continue;
+      const clave = [a.id, b.id].sort().join('|');
+      if (vistos.has(clave)) continue;
+      vistos.add(clave);
+      salida.push({ a: a, b: b, tipo: 'choque' });
+    }
+    for (const a of eventos) {
+      const t = this.trasladoImposible(a, eventos);
+      if (!t) continue;
+      const clave = 'tr|' + [a.id, t.evento.id].sort().join('|');
+      if (vistos.has(clave)) continue;
+      vistos.add(clave);
+      salida.push({ a: a, b: t.evento, tipo: 'traslado', minutos: t.minutos });
+    }
+    return salida.sort((x, y) => (String(x.a.inicio) > String(y.a.inicio) ? 1 : -1));
+  }
+};
 
 /* --------------------------------------------------------------------------
    Migración de identificadores.
@@ -2146,6 +2733,138 @@ function seedDemo() {
   ] : [];
 
   db.review_attempts = [];
+
+  /* ---------------- CUENTAS DE GOOGLE (demostración) ----------------
+     Datos de muestra para que se vea cómo queda la vista consolidada antes de
+     conectar nada. Todos llevan `es_demo` y la interfaz los marca como
+     ejemplo. Ninguno se sube a Supabase ni sale de este navegador.        */
+  const gTrabajo = uid(), gUni = uid();
+  db.google_connections = [
+    { id: gTrabajo, google_sub: 'demo-trabajo', email: 'ejemplo.trabajo@touch-jobs.com',
+      nombre: 'Cuenta de trabajo (ejemplo)', avatar: '', tipo: 'trabajo', color: '#0D5C63',
+      estado: 'activa', gmail: true, calendar: true, drive: true, scopes: [],
+      ultima_sync: nowNaive(), error: '', error_codigo: '', es_demo: true,
+      created_at: nowNaive(), updated_at: nowNaive() },
+    { id: gUni, google_sub: 'demo-uni', email: 'ejemplo.alumno@universidad.cl',
+      nombre: 'Cuenta de universidad (ejemplo)', avatar: '', tipo: 'universidad', color: '#4F46E5',
+      estado: 'activa', gmail: true, calendar: true, drive: false, scopes: [],
+      ultima_sync: nowNaive(), error: '', error_codigo: '', es_demo: true,
+      created_at: nowNaive(), updated_at: nowNaive() }
+  ];
+
+  const correo = (conn, quien, mail, asunto, resumen, horas, det, area, extra) =>
+    Object.assign({ id: uid(), connection_id: conn, external_id: 'demo-' + uid().slice(0, 8),
+      thread_id: null, remitente: quien, remitente_email: mail, para: ['carlos@touch-jobs.com'], copia: [],
+      asunto: asunto, fecha: nowNaive().slice(0, 11) + '09:00', etiquetas: ['INBOX', 'UNREAD'],
+      no_leido: true, importante: false, destacado: false, resumen: resumen,
+      enlace: 'https://mail.google.com/', detecciones: det, categoria_manual: null, area: area,
+      respondido_en: null, es_demo: true, created_at: nowNaive(), updated_at: nowNaive() },
+      { fecha: new Date(Date.now() - horas * 3600000).toISOString().slice(0, 16) }, extra || {});
+
+  const evd = (tipo, etiqueta, evidencia, fecha) => ({ tipo, etiqueta, evidencia, fecha: fecha || null });
+  const enDias = (n) => new Date(Date.now() + n * 86400000).toISOString();
+
+  db.google_messages = [
+    correo(gTrabajo, 'Paulina Reyes', 'paulina.reyes@ejemplo.cl',
+      'URGENTE: sin cobertura en Paris Costanera',
+      'Hola Carlos, hoy no llegó la promotora de Paris Costanera y necesito respuesta antes de las 14:00 para avisar a la tienda.',
+      3, [evd('incidencia', 'Incidencia operacional', '…no llegó la promotora de Paris Costanera…'),
+          evd('solicitud', 'Te piden algo', '…necesito respuesta antes de las 14:00…'),
+          evd('plazo', 'Fecha límite', '…antes de las 14:00… · «hoy»', enDias(0))], 'trabajo'),
+    correo(gTrabajo, 'Rodrigo Salas', 'rodrigo.salas@ejemplo.cl',
+      'Aprobación presupuesto activación Gnomo Wear',
+      'Te dejo el presupuesto de la activación de septiembre. Necesito tu visto bueno para cerrar con el proveedor.',
+      26, [evd('aprobacion', 'Aprobación pendiente', '…Necesito tu visto bueno para cerrar…'),
+           evd('documento', 'Documento solicitado', '…Te dejo el presupuesto…')], 'trabajo'),
+    correo(gTrabajo, 'Camila Ortiz', 'camila.ortiz@ejemplo.cl',
+      'Liquidaciones de agosto pendientes de firma',
+      'Quedan 4 personas sin firmar su liquidación en BUK. El plazo vence el viernes.',
+      50, [evd('remuneracion', 'Remuneraciones', '…4 personas sin firmar su liquidación…'),
+           evd('plazo', 'Fecha límite', '…El plazo vence el viernes… · «viernes»', enDias(2))], 'trabajo'),
+    correo(gUni, 'Prof. ejemplo (demostración)', 'profesor.ejemplo@universidad.cl',
+      'Control de Derecho Procesal I — próximo lunes',
+      'Recuerden que el control de la unidad 2 es el próximo lunes. Entra toda la materia vista en clases.',
+      20, [evd('evaluacion', 'Evaluación', '…el control de la unidad 2 es el próximo lunes…', enDias(2))], 'universidad'),
+    correo(gUni, 'Secretaría (ejemplo)', 'secretaria.ejemplo@universidad.cl',
+      'Lectura obligatoria semana 7',
+      'Se subió al aula virtual el capítulo 4 del texto obligatorio para la próxima ayudantía.',
+      70, [evd('lectura', 'Lectura', '…el capítulo 4 del texto obligatorio…')], 'universidad'),
+    correo(gTrabajo, 'Boletín (ejemplo)', 'noreply@ejemplo.cl',
+      'Novedades del sector retail',
+      'Resumen mensual de tendencias del retail en Chile.', 96, [], 'trabajo',
+      { no_leido: false, etiquetas: ['INBOX'] })
+  ];
+
+  const evtG = (conn, titulo, dias, hIni, hFin, lugar, area, extra) =>
+    Object.assign({ id: uid(), connection_id: conn, calendar_id: 'primary', calendario: 'Principal',
+      external_id: 'demo-' + uid().slice(0, 8), titulo: titulo, descripcion: '', lugar: lugar,
+      enlace_reunion: '', inicio: addDays(todayISO(), dias) + 'T' + hIni,
+      fin: addDays(todayISO(), dias) + 'T' + hFin, todo_el_dia: false, organizador: '',
+      asistentes: [], estado_evento: 'confirmed', enlace: 'https://calendar.google.com/',
+      color: conn === gUni ? '#4F46E5' : '#0D5C63', area: area, preparar: false,
+      es_demo: true, created_at: nowNaive(), updated_at: nowNaive() }, extra || {});
+
+  db.google_calendar_events = [
+    evtG(gTrabajo, 'Reunión de coordinación Trauko', 0, '11:00', '12:00', 'Oficina Providencia', 'trabajo',
+      { descripcion: 'Preparar el reporte de cobertura y el plan de recuperación de las dos tiendas.', preparar: true }),
+    /* Este se pisa a propósito con el anterior: es el ejemplo de conflicto. */
+    evtG(gTrabajo, 'Visita Paris Costanera', 0, '11:30', '13:00', 'Mall Costanera Center', 'trabajo'),
+    evtG(gUni, 'Cátedra Derecho Procesal I', 0, '18:30', '20:00', 'Sala 402', 'universidad'),
+    evtG(gTrabajo, 'Videollamada Dolce Gusto', 1, '10:00', '10:45', '', 'trabajo',
+      { enlace_reunion: 'https://meet.google.com/ejemplo' }),
+    evtG(gUni, 'Control unidad 2', 2, '18:30', '20:00', 'Sala 402', 'universidad')
+  ];
+
+  db.google_drive_items = [
+    { id: uid(), connection_id: gTrabajo, external_id: 'demo-d1', nombre: 'Cobertura agosto — Trauko.xlsx',
+      tipo: 'application/vnd.google-apps.spreadsheet', icono: '', enlace: 'https://drive.google.com/',
+      dueno: 'ejemplo.trabajo@touch-jobs.com', modificado: nowNaive(), bytes: null, carpeta_id: null,
+      carpeta: 'Reportes', origen: 'reciente', area: 'trabajo', elegido: false, es_demo: true,
+      created_at: nowNaive(), updated_at: nowNaive() },
+    { id: uid(), connection_id: gTrabajo, external_id: 'demo-d2', nombre: 'Presupuesto activación Gnomo.pdf',
+      tipo: 'application/pdf', icono: '', enlace: 'https://drive.google.com/',
+      dueno: 'rodrigo.salas@ejemplo.cl', modificado: addDays(todayISO(), -1) + 'T16:20', bytes: 284000,
+      carpeta_id: null, carpeta: 'Compartidos conmigo', origen: 'enlazado', area: 'trabajo',
+      elegido: false, es_demo: true, created_at: nowNaive(), updated_at: nowNaive() },
+    { id: uid(), connection_id: gUni, external_id: 'demo-d3', nombre: 'Apuntes Procesal — unidad 2.docx',
+      tipo: 'application/vnd.google-apps.document', icono: '', enlace: 'https://drive.google.com/',
+      dueno: 'ejemplo.alumno@universidad.cl', modificado: addDays(todayISO(), -2) + 'T21:10', bytes: null,
+      carpeta_id: null, carpeta: 'Universidad', origen: 'elegido', area: 'universidad', elegido: true,
+      es_demo: true, created_at: nowNaive(), updated_at: nowNaive() }
+  ];
+
+  db.suggested_actions = [
+    { id: uid(), clave: 'message:demo-1:incidencia', tipo: 'tarea', estado: 'pendiente',
+      origen_tipo: 'message', origen_id: db.google_messages[0].id, origen_externo: db.google_messages[0].external_id,
+      connection_id: gTrabajo, titulo: 'Gestionar la incidencia de Paulina Reyes',
+      detalle: 'URGENTE: sin cobertura en Paris Costanera', motivo: 'Incidencia operacional',
+      motivos: [{ regla: 'incidencia', texto: 'Incidencia operacional', evidencia: '…no llegó la promotora…' },
+                { regla: 'plazo', texto: 'Fecha límite', evidencia: '…antes de las 14:00…' }],
+      vence: nowNaive().slice(0, 11) + '14:00', area: 'trabajo', prioridad: 'urgente', confianza: 80,
+      task_id: null, decidido_en: null, es_demo: true, created_at: nowNaive(), updated_at: nowNaive() },
+    { id: uid(), clave: 'message:demo-2:aprobacion', tipo: 'tarea', estado: 'pendiente',
+      origen_tipo: 'message', origen_id: db.google_messages[1].id, origen_externo: db.google_messages[1].external_id,
+      connection_id: gTrabajo, titulo: 'Revisar y aprobar lo pedido por Rodrigo Salas',
+      detalle: 'Aprobación presupuesto activación Gnomo Wear', motivo: 'Aprobación pendiente',
+      motivos: [{ regla: 'aprobacion', texto: 'Aprobación pendiente', evidencia: '…Necesito tu visto bueno…' }],
+      vence: null, area: 'trabajo', prioridad: 'alta', confianza: 65,
+      task_id: null, decidido_en: null, es_demo: true, created_at: nowNaive(), updated_at: nowNaive() },
+    { id: uid(), clave: 'event:demo-3:meeting_prep', tipo: 'preparar', estado: 'pendiente',
+      origen_tipo: 'event', origen_id: db.google_calendar_events[0].id,
+      origen_externo: db.google_calendar_events[0].external_id, connection_id: gTrabajo,
+      titulo: 'Preparar: Reunión de coordinación Trauko', detalle: 'Oficina Providencia',
+      motivo: 'La descripción del evento pide preparar material',
+      motivos: [{ regla: 'evento_sin_preparar', texto: 'La descripción menciona material o preparación previa',
+                  evidencia: 'Preparar el reporte de cobertura…' }],
+      vence: addDays(todayISO(), 0) + 'T09:00', area: 'trabajo', prioridad: 'media', confianza: 60,
+      task_id: null, decidido_en: null, es_demo: true, created_at: nowNaive(), updated_at: nowNaive() }
+  ];
+
+  db.urgency_rules = [];
+  db.priority_senders = [
+    { id: uid(), email: 'paulina.reyes@ejemplo.cl', etiqueta: 'Jefatura de tienda (ejemplo)',
+      area: 'trabajo', peso: 25, created_at: nowNaive(), updated_at: nowNaive() }
+  ];
 
   /* ---------------- BLOQUES DE TIEMPO ---------------- */
   db.time_blocks = [
@@ -3431,6 +4150,386 @@ async function abrirPrimeraSincronizacion() {
     '</div>', '', 'max-w-lg', 'Esta elección se puede repetir después');
 }
 
+/* ==========================================================================
+   8.b CUENTAS DE GOOGLE — INTERACCIÓN
+   ========================================================================== */
+
+/** Sincroniza una cuenta o todas, mostrando lo que pasó sin tecnicismos. */
+async function ejecutarGoogle(connectionId, exito) {
+  if (!Nube.conectado) return toast('Inicia sesión en Nexo para sincronizar Google', 'warn');
+  const demo = store.all('google_connections').some(c => c.es_demo);
+  if (demo && !store.all('google_connections').some(c => !c.es_demo)) {
+    return toast('Las cuentas de ejemplo no sincronizan. Conecta una cuenta real desde Configuración.', 'warn');
+  }
+  UI.cargando = true; render();
+  try {
+    const r = await Google.sincronizar(connectionId, 'manual');
+    const conError = (r && r.cuentas || []).filter(c => c.estado === 'error' || c.estado === 'reauth_required');
+    if (conError.length) {
+      const primera = conError[0];
+      const detalle = primera.servicios
+        ? Object.values(primera.servicios).find(s => s.mensaje)
+        : null;
+      toast((detalle && detalle.mensaje) || primera.omitida || 'Una cuenta necesita atención', 'warn');
+    } else {
+      const nuevos = (r && r.cuentas || []).reduce((a, c) =>
+        a + Object.values(c.servicios || {}).reduce((x, s) => x + (s.nuevos || 0), 0), 0);
+      toast(nuevos ? nuevos + ' elemento(s) nuevo(s)' : (exito || 'Todo al día'), 'exito');
+    }
+  } catch (e) {
+    toast(e.message || 'No se pudo sincronizar', 'error');
+    if (e.ayuda) setTimeout(() => abrirAyudaGoogle(e), 400);
+  } finally { UI.cargando = false; render(); }
+}
+
+/** Explica un bloqueo con todo el detalle, sin ocupar un toast diminuto. */
+function abrirAyudaGoogle(e) {
+  const esAdmin = e.codigo === 'admin_policy_enforced';
+  abrirModal(esAdmin ? 'Tu organización bloquea el acceso' : 'No se pudo conectar',
+    '<p class="text-[13.5px] mb-3">' + esc(e.message) + '</p>' +
+    (e.ayuda ? '<div class="text-[12.5px] leading-relaxed p-3 rounded-xl2 bg-ink-50 dark:bg-ink-850 border border-ink-200 dark:border-ink-800">' +
+      esc(e.ayuda) + '</div>' : '') +
+    (esAdmin
+      ? '<p class="text-[12px] text-ink-500 dark:text-ink-400 mt-3">Esto no es un problema de Nexo ni de tu contraseña: ' +
+        'es una política de Google Workspace que impide que aplicaciones externas lean esa cuenta hasta que el ' +
+        'administrador las autorice.</p>'
+      : ''),
+    btn('Entendido', 'modal-cerrar', '', BTN.secundario), 'max-w-lg');
+}
+
+/** Elegir qué cuenta conectar y con qué permisos. */
+function abrirConectarGoogle(tipoSugerido, correoSugerido, connectionId) {
+  const existente = connectionId ? store.get('google_connections', connectionId) : null;
+  const tipo = existente ? existente.tipo : (tipoSugerido || 'trabajo');
+
+  const opcionTipo = (k) => {
+    const t = TIPO_CUENTA_GOOGLE[k];
+    return '<label class="press flex-1 min-w-[110px] cursor-pointer flex items-center gap-2 p-2.5 rounded-xl2 border ' +
+      'border-ink-200 dark:border-ink-800 hover:bg-ink-50 dark:hover:bg-ink-850 has-[:checked]:acc-border has-[:checked]:acc-soft">' +
+      '<input type="radio" name="g-tipo-cuenta" value="' + k + '"' + (k === tipo ? ' checked' : '') + ' class="w-4 h-4">' +
+      '<span class="inline-block w-2.5 h-2.5 rounded-full" style="background:' + t.color + '"></span>' +
+      '<span class="text-[13px] font-medium">' + t.label + '</span></label>';
+  };
+
+  const opcionServicio = (k, marcado) => {
+    const s = SERVICIOS_GOOGLE[k];
+    return '<label class="flex items-start gap-2.5 p-2.5 rounded-xl2 border border-ink-200 dark:border-ink-800 cursor-pointer ' +
+      'hover:bg-ink-50 dark:hover:bg-ink-850">' +
+      '<input type="checkbox" name="g-serv" value="' + k + '"' + (marcado ? ' checked' : '') + ' class="rounded w-4 h-4 mt-0.5">' +
+      '<span class="min-w-0"><span class="block text-[13px] font-medium">' + s.label + '</span>' +
+      '<span class="block text-[11.5px] text-ink-500 dark:text-ink-400 mt-0.5 leading-snug">' + esc(s.detalle) + '</span></span></label>';
+  };
+
+  abrirModal(existente ? 'Agregar permisos a ' + esc(existente.email) : 'Conectar cuenta Google',
+    '<div class="flex flex-col gap-3">' +
+      (existente ? '' :
+        '<div><p class="' + LBL + '">Tipo de cuenta</p>' +
+        '<div class="flex flex-wrap gap-2">' + Object.keys(TIPO_CUENTA_GOOGLE).map(opcionTipo).join('') + '</div>' +
+        '<p class="text-[11.5px] text-ink-500 dark:text-ink-400 mt-1.5">Define el color y en qué espacio aparece lo que llegue de esta cuenta.</p></div>') +
+
+      '<div><p class="' + LBL + '">Qué quieres que Nexo lea</p>' +
+      '<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">' +
+        opcionServicio('gmail', !existente || existente.gmail) +
+        opcionServicio('calendar', !existente || existente.calendar) +
+        opcionServicio('drive', existente ? existente.drive : false) +
+      '</div></div>' +
+
+      '<details class="text-[12px]"><summary class="cursor-pointer text-ink-500 dark:text-ink-400 py-1">Opciones avanzadas</summary>' +
+        '<div class="flex flex-col gap-2 mt-2 pl-1">' +
+          '<label class="flex items-start gap-2 cursor-pointer">' +
+            '<input type="checkbox" id="g-cuerpo" class="rounded w-4 h-4 mt-0.5">' +
+            '<span>Permitir leer el <strong>contenido</strong> de los correos dentro de Nexo. ' +
+            '<span class="text-ink-500 dark:text-ink-400">Sin esto solo se ve remitente, asunto y fragmento, que es lo mínimo ' +
+            'necesario para priorizar. El contenido se pide al momento y no se guarda.</span></span></label>' +
+          '<label class="flex items-start gap-2 cursor-pointer">' +
+            '<input type="checkbox" id="g-archivos" class="rounded w-4 h-4 mt-0.5">' +
+            '<span>Permitir abrir <strong>archivos seleccionados</strong> de Drive. ' +
+            '<span class="text-ink-500 dark:text-ink-400">Solo los que tú elijas, uno por uno. Nunca todo el Drive.</span></span></label>' +
+        '</div>' +
+      '</details>' +
+
+      '<div class="text-[12px] leading-relaxed p-3 rounded-xl2 bg-ink-50 dark:bg-ink-850 border border-ink-200 dark:border-ink-800">' +
+        '<p class="font-medium mb-1">Lo que Nexo <strong>no</strong> puede hacer</p>' +
+        '<p class="text-ink-600 dark:text-ink-300">Enviar correos, responder, borrar mensajes, crear o cambiar eventos y ' +
+        'modificar archivos. Todos los permisos son de lectura.</p>' +
+      '</div>' +
+    '</div>',
+    btn('Cancelar', 'modal-cerrar', '', BTN.secundario) +
+    '<button type="button" id="g-ir" class="' + BTN.primario + '">' + ico('nube', 16) + 'Continuar con Google</button>',
+    'max-w-xl', 'Se abrirá una ventana de Google. Nexo nunca ve tu contraseña.');
+
+  setTimeout(() => {
+    const boton = document.getElementById('g-ir');
+    if (!boton) return;
+    boton.onclick = async () => {
+      const servicios = Array.from(document.querySelectorAll('input[name="g-serv"]:checked')).map(x => x.value);
+      if (!servicios.length) return toast('Elige al menos un servicio', 'warn');
+      const elegido = document.querySelector('input[name="g-tipo-cuenta"]:checked');
+      const cuerpo = document.getElementById('g-cuerpo');
+      const archivos = document.getElementById('g-archivos');
+      cerrarModal();
+      UI.cargando = true; render();
+      try {
+        const r = await Google.conectar(elegido ? elegido.value : tipo, servicios, {
+          cuerpoGmail: cuerpo && cuerpo.checked,
+          archivosDrive: archivos && archivos.checked,
+          correo: existente ? existente.email : correoSugerido
+        });
+        UI.cargando = false;
+        if (r && r.ok) {
+          toast('Cuenta conectada: ' + (r.email || ''), 'exito');
+          UI.cargando = true; render();
+          try { await Google.sincronizar(r.connection_id, 'manual'); } catch (e) { console.warn(e.message); }
+          UI.cargando = false;
+        } else if (r && r.error === 'ventana_cerrada') {
+          toast('Cerraste la ventana antes de autorizar. No se conectó nada.');
+        } else if (r && r.error) {
+          abrirAyudaGoogle({ codigo: r.error, message: 'Google no autorizó la conexión.', ayuda: '' });
+        }
+      } catch (e) {
+        UI.cargando = false;
+        toast(e.message || 'No se pudo iniciar la conexión', 'error');
+        if (e.ayuda) setTimeout(() => abrirAyudaGoogle(e), 400);
+      }
+      render();
+    };
+  }, 30);
+}
+
+function abrirTipoCuenta(id) {
+  const c = store.get('google_connections', id); if (!c) return;
+  const opcion = (k) => {
+    const t = TIPO_CUENTA_GOOGLE[k];
+    return '<button type="button" data-act="g-set-tipo" data-id="' + id + '" data-v="' + k + '" ' +
+      'class="press focus-ring w-full text-left flex items-center gap-3 p-3 rounded-xl2 border ' +
+      (c.tipo === k ? 'acc-border acc-soft' : 'border-ink-200 dark:border-ink-800 hover:bg-ink-50 dark:hover:bg-ink-850') + '">' +
+      '<span class="w-8 h-8 rounded-lg" style="background:' + t.color + '"></span>' +
+      '<span class="text-[13.5px] font-medium">' + t.label + '</span></button>';
+  };
+  abrirModal('Tipo de cuenta',
+    '<p class="text-[12.5px] text-ink-500 dark:text-ink-400 mb-3">Define el color de la cuenta y en qué espacio aparecen sus correos y eventos.</p>' +
+    '<div class="flex flex-col gap-2">' + Object.keys(TIPO_CUENTA_GOOGLE).map(opcion).join('') + '</div>',
+    btn('Cerrar', 'modal-cerrar', '', BTN.secundario), 'max-w-sm');
+}
+
+function abrirDesconectar(id) {
+  const c = store.get('google_connections', id); if (!c) return;
+  abrirModal('Desconectar ' + esc(c.email),
+    '<p class="text-[13.5px] mb-3">Se revocará el acceso de Nexo <strong>en Google</strong> y se borrarán los permisos guardados. ' +
+    'Tus correos, eventos y archivos <strong>no se tocan</strong>: siguen intactos en tu cuenta de Google.</p>' +
+    '<label class="flex items-start gap-2 text-[13px] cursor-pointer p-3 rounded-xl2 border border-ink-200 dark:border-ink-800">' +
+      '<input type="checkbox" id="g-borrar-datos" class="rounded w-4 h-4 mt-0.5">' +
+      '<span>Borrar también de Nexo los correos, eventos y archivos que se habían traído de esta cuenta.' +
+      '<span class="block text-[11.5px] text-ink-500 dark:text-ink-400 mt-0.5">Si lo dejas sin marcar, quedan visibles pero dejan de actualizarse.</span></span>' +
+    '</label>',
+    btn('Cancelar', 'modal-cerrar', '', BTN.secundario) +
+    '<button type="button" id="g-conf-desc" class="' + BTN.peligro + '">Desconectar</button>',
+    'max-w-lg');
+
+  setTimeout(() => {
+    const b = document.getElementById('g-conf-desc'); if (!b) return;
+    b.onclick = async () => {
+      const borrar = document.getElementById('g-borrar-datos');
+      const conBorrado = !!(borrar && borrar.checked);
+      cerrarModal(); UI.cargando = true; render();
+      try {
+        if (c.es_demo) {
+          /* La cuenta de ejemplo no existe en Google: se quita y ya. */
+          DB.google_connections = DB.google_connections.filter(x => x.id !== id);
+          ['google_messages', 'google_calendar_events', 'google_drive_items'].forEach(t => {
+            DB[t] = (DB[t] || []).filter(x => x.connection_id !== id);
+          });
+          DB.suggested_actions = (DB.suggested_actions || []).filter(s => s.connection_id !== id);
+          saveDB();
+          toast('Cuenta de ejemplo quitada', 'exito');
+        } else {
+          const r = await Google.desconectar(id, conBorrado);
+          toast(r && r.mensaje ? r.mensaje : 'Cuenta desconectada', 'exito');
+        }
+      } catch (e) {
+        toast(e.message || 'No se pudo desconectar', 'error');
+      } finally { UI.cargando = false; render(); }
+    };
+  }, 30);
+}
+
+/** Detalle de un correo, con la explicación completa de por qué está donde está. */
+function verCorreo(id) {
+  const m = store.get('google_messages', id); if (!m) return;
+  const u = Urgencia.correo(m);
+  const cat = CATEGORIA_CORREO[u.categoria];
+  const cuenta = Google.cuentaDe(m.connection_id);
+
+  abrirModal(m.asunto || '(sin asunto)',
+    '<div class="flex flex-wrap items-center gap-1.5 mb-3">' +
+      badge(cat.label, cat.cls) + chipCuenta(m.connection_id) + areaBadge(m.area) +
+      (m.no_leido ? badge('No leído', 'bg-petrol-100 text-petrol-700 dark:bg-petrol-500/25 dark:text-petrol-100') : '') +
+      (m.respondido_en ? badge('Respondido', 'bg-okc-100 text-okc-700 dark:bg-okc-500/20 dark:text-okc-200') : '') +
+    '</div>' +
+    '<p class="text-[13px]"><strong>' + esc(m.remitente || m.remitente_email) + '</strong> ' +
+      '<span class="text-ink-500 dark:text-ink-400">&lt;' + esc(m.remitente_email) + '&gt;</span></p>' +
+    '<p class="text-[12px] text-ink-500 dark:text-ink-400">' + fmtFechaHora(m.fecha) +
+      (cuenta ? ' · ' + esc(cuenta.email) : '') + '</p>' +
+
+    '<div class="mt-3 p-3 rounded-xl2 bg-ink-50 dark:bg-ink-850 border border-ink-200 dark:border-ink-800">' +
+      '<p class="text-[12px] font-semibold mb-1">Fragmento</p>' +
+      '<p class="text-[12.5px] prose-note">' + esc(m.resumen || '(sin fragmento)') + '</p>' +
+      '<p class="text-[11px] text-ink-500 dark:text-ink-400 mt-2">Nexo guarda solo este fragmento; el cuerpo completo se queda en Gmail.</p>' +
+    '</div>' +
+    '<div id="g-cuerpo-caja"></div>' +
+
+    (u.motivos.length
+      ? '<div class="mt-3">' +
+          '<p class="text-[12px] font-semibold">Por qué está clasificado como «' + cat.label + '» ' +
+            '<span class="text-ink-400 tnum font-normal">(' + u.puntos + ' puntos)</span></p>' +
+          motivosHtml(u.motivos) +
+          '<p class="text-[11px] text-ink-500 dark:text-ink-400 mt-2">Cada motivo cita el texto exacto del correo. ' +
+          'Puedes ajustar los pesos en Configuración → Reglas de urgencia.</p>' +
+        '</div>'
+      : '<p class="text-[12px] text-ink-500 dark:text-ink-400 mt-3">Ninguna regla se activó con este correo.</p>') +
+
+    ((m.detecciones || []).length
+      ? '<div class="mt-3"><p class="text-[12px] font-semibold">Qué se detectó</p>' +
+        '<div class="flex flex-wrap gap-1.5 mt-1.5">' +
+          m.detecciones.map(d => badge(esc(d.etiqueta) + (d.fecha ? ' · ' + fmtFecha(tzIn(d.fecha)) : ''),
+            'bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300')).join('') +
+        '</div></div>'
+      : ''),
+
+    btn('Cerrar', 'modal-cerrar', '', BTN.secundario) +
+    (m.respondido_en ? '' : btn('Marcar respondido', 'g-marcar-respondido', 'data-id="' + m.id + '"', BTN.fantasma)) +
+    (cuenta && (cuenta.scopes || []).some(s => String(s).includes('gmail.readonly'))
+      ? btn('Leer aquí', 'g-cuerpo-correo', 'data-id="' + m.id + '"', BTN.fantasma) : '') +
+    btn(ico('enviar', 15) + 'Abrir en Gmail', 'g-abrir-gmail', 'data-id="' + m.id + '"'),
+    'max-w-2xl');
+}
+
+/** Pide el contenido al servidor y lo muestra sin guardarlo. */
+async function cargarCuerpoCorreo(id) {
+  const m = store.get('google_messages', id); if (!m) return;
+  const caja = document.getElementById('g-cuerpo-caja');
+  if (caja) caja.innerHTML = '<p class="text-[12.5px] text-ink-500 dark:text-ink-400 mt-3">Pidiendo el contenido a Gmail…</p>';
+  try {
+    const r = await Google.detalleCorreo(m.connection_id, m.external_id);
+    if (!caja) return;
+    if (!r.cuerpo_disponible) {
+      caja.innerHTML = '<div class="mt-3 p-3 rounded-xl2 border border-warnc-200 dark:border-warnc-500/30 bg-warnc-50 dark:bg-warnc-500/10 text-[12.5px]">' +
+        esc(r.mensaje || 'Esta cuenta no autorizó la lectura del contenido.') + '</div>';
+      return;
+    }
+    caja.innerHTML = '<div class="mt-3 p-3 rounded-xl2 border border-ink-200 dark:border-ink-800">' +
+      '<p class="text-[12px] font-semibold mb-1">Contenido</p>' +
+      '<div class="text-[12.5px] prose-note max-h-72 overflow-auto whitespace-pre-wrap">' + esc(r.cuerpo || '(vacío)') + '</div>' +
+      (r.truncado ? '<p class="text-[11px] text-ink-500 dark:text-ink-400 mt-2">Texto recortado. Ábrelo en Gmail para verlo completo.</p>' : '') +
+      '<p class="text-[11px] text-ink-500 dark:text-ink-400 mt-2">' + esc(r.aviso || '') + '</p>' +
+      '</div>';
+  } catch (e) {
+    if (caja) caja.innerHTML = '<p class="text-[12.5px] text-critc-600 dark:text-critc-300 mt-3">' + esc(e.message) + '</p>';
+  }
+}
+
+/** Confirmación antes de crear la tarea. Editable: nada se guarda a ciegas. */
+function abrirConfirmarSugerencia(id) {
+  const s = store.get('suggested_actions', id); if (!s) return;
+  openForm({
+    title: 'Crear tarea desde la sugerencia',
+    nota: 'Revisa y ajusta antes de guardar. <strong>Nexo no crea nada sin tu confirmación.</strong>' +
+      (s.motivo ? '<br>Motivo detectado: ' + esc(s.motivo) : ''),
+    fields: [
+      { k: 'titulo', label: 'Título', req: true, col: 2 },
+      { k: 'descripcion', label: 'Detalle', type: 'textarea', col: 2 },
+      { k: 'area', label: 'Espacio', type: 'select', opts: Object.keys(AREAS).map(k => ({ v: k, t: AREAS[k].label })) },
+      { k: 'prioridad', label: 'Prioridad', type: 'select', opts: Object.keys(PRIORIDADES).map(k => ({ v: k, t: PRIORIDADES[k].label })) },
+      { k: 'due_at', label: 'Vence', type: 'datetime-local', col: 2,
+        hint: s.vence ? 'La fecha viene del propio correo; revísala.' : 'La fuente no traía fecha: ponla tú si corresponde.' }
+    ],
+    values: {
+      titulo: s.titulo,
+      descripcion: (s.detalle ? s.detalle + '\n\n' : '') +
+        (s.motivos || []).map(m => '· ' + (m.texto || '') + (m.evidencia ? ': ' + m.evidencia : '')).join('\n'),
+      area: s.area, prioridad: s.prioridad, due_at: s.vence || ''
+    },
+    onSave(d) {
+      const t = store.insert('tasks', {
+        area: d.area, titulo: d.titulo, descripcion: d.descripcion || '', categoria: 'Desde Google',
+        responsable: '', prioridad: d.prioridad, estado: 'pendiente', due_at: d.due_at || null,
+        brand_id: null, subject_id: null, recurrencia: 'ninguna', checklist: [], enlaces: [],
+        completed_at: null
+      });
+      store.update('suggested_actions', id, { estado: 'aceptada', task_id: t.id, decidido_en: nowNaive() });
+      Cloud.registrarActividad('task', t.id, 'create', 'Creada desde una sugerencia de Google');
+      toast('Tarea creada', 'exito'); render();
+    }
+  });
+}
+
+/** Remitentes que para ti siempre son prioritarios. */
+function abrirRemitentes() {
+  const lista = store.all('priority_senders');
+  abrirModal('Remitentes prioritarios',
+    '<p class="text-[12.5px] text-ink-500 dark:text-ink-400 mb-3">Los correos de estas personas suman puntos en la bandeja prioritaria.</p>' +
+    (lista.length
+      ? '<ul class="divide-y divide-ink-100 dark:divide-ink-800 mb-3">' + lista.map(p =>
+          '<li class="py-2 flex items-center justify-between gap-3">' +
+            '<div class="min-w-0"><p class="text-[13px] font-medium truncate">' + esc(p.email) + '</p>' +
+            '<p class="text-[11.5px] text-ink-500 dark:text-ink-400">' + esc(p.etiqueta || '') +
+            ' · +' + p.peso + ' puntos</p></div>' +
+            btn('Quitar', 'g-borrar-remitente', 'data-id="' + p.id + '"', BTN.fantasma) +
+          '</li>').join('') + '</ul>'
+      : '<p class="text-[12.5px] text-ink-500 dark:text-ink-400 mb-3">Todavía no agregas ninguno.</p>'),
+    btn('Cerrar', 'modal-cerrar', '', BTN.secundario) +
+    btn(ico('plus', 15) + 'Agregar', 'g-nuevo-remitente'),
+    'max-w-lg');
+}
+
+function formRemitente() {
+  openForm({
+    title: 'Remitente prioritario',
+    fields: [
+      { k: 'email', label: 'Correo', type: 'email', req: true, col: 2 },
+      { k: 'etiqueta', label: 'Quién es', col: 2, hint: 'Ej: «Jefatura Trauko», «Coordinadora de carrera».' },
+      { k: 'area', label: 'Espacio', type: 'select', opts: Object.keys(AREAS).map(k => ({ v: k, t: AREAS[k].label })) },
+      { k: 'peso', label: 'Puntos que suma', type: 'number', min: 0, max: 100 }
+    ],
+    values: { email: '', etiqueta: '', area: 'trabajo', peso: 25 },
+    onSave(d) {
+      d.email = String(d.email).toLowerCase();
+      if (store.all('priority_senders').some(p => p.email === d.email)) return toast('Ese correo ya está en la lista', 'warn');
+      store.insert('priority_senders', d);
+      toast('Remitente agregado', 'exito'); abrirRemitentes();
+    }
+  });
+}
+
+/** Ver y ajustar las reglas del motor de urgencia. */
+function abrirReglasUrgencia() {
+  const propias = store.all('urgency_rules');
+  const reglas = propias.length ? propias : Urgencia.PORDEFECTO;
+  const deFabrica = !propias.length;
+
+  abrirModal('Reglas de urgencia',
+    '<p class="text-[12.5px] text-ink-500 dark:text-ink-400 mb-3">' +
+      'Así decide Nexo qué es urgente. Cada regla suma puntos y siempre queda escrito por qué. ' +
+      '<strong>70 o más</strong> es urgente, <strong>40</strong> importante, <strong>20</strong> en espera.' +
+      (deFabrica ? '<br>Estas son las reglas de fábrica. Se guardarán en tu cuenta cuando cambies alguna.' : '') +
+    '</p>' +
+    '<ul class="divide-y divide-ink-100 dark:divide-ink-800">' + reglas.map(r =>
+      '<li class="py-2.5 flex items-start justify-between gap-3">' +
+        '<div class="min-w-0">' +
+          '<p class="text-[13px] font-medium">' + esc(r.etiqueta) + '</p>' +
+          '<p class="text-[11.5px] text-ink-500 dark:text-ink-400">' + esc(r.descripcion || '') +
+            ' · aplica a ' + (r.aplica_a === 'both' ? 'correos y eventos' : r.aplica_a === 'event' ? 'eventos' : 'correos') + '</p>' +
+        '</div>' +
+        '<span class="shrink-0 flex items-center gap-2">' +
+          badge('+' + r.peso, 'bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300') +
+          '<label class="inline-flex items-center gap-1.5 text-[11.5px] cursor-pointer">' +
+            '<input type="checkbox" data-act="g-regla-activa" data-codigo="' + esc(r.codigo) + '"' +
+              (r.activa !== false ? ' checked' : '') + ' class="rounded w-4 h-4">Activa</label>' +
+        '</span>' +
+      '</li>').join('') + '</ul>',
+    btn('Cerrar', 'modal-cerrar', '', BTN.secundario), 'max-w-2xl');
+}
+
 /** Ejecuta una sincronización mostrando estado de carga y errores claros. */
 async function sincronizar(direccion) {
   cerrarModal();
@@ -3813,11 +4912,202 @@ Vistas.inicio = function () {
   return avisoDemo + hero + bandaCritica +
     '<div class="mb-4">' + cardPrioridades + '</div>' +
     metricas +
+    bloquesGoogle() +
     '<div class="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">' +
       cardAgenda + cardVencidos + cardMarcas + cardEvals + cardLecturas + cardBloques + cardAlertas +
       '<div class="lg:col-span-2">' + cardAvance + '</div>' +
     '</div>';
 };
+
+/* ==========================================================================
+   9.b PANEL DE LAS CUENTAS CONECTADAS
+   --------------------------------------------------------------------------
+   Aparece en Inicio solo si hay al menos una cuenta de Google. Respeta el
+   filtro Trabajo / Universidad / Personal del selector de espacios, igual que
+   el resto de la aplicación.
+   ========================================================================== */
+function chipCuenta(connectionId) {
+  const c = Google.cuentaDe(connectionId);
+  if (!c) return '';
+  const t = TIPO_CUENTA_GOOGLE[c.tipo] || TIPO_CUENTA_GOOGLE.trabajo;
+  return '<span class="inline-flex items-center gap-1 text-[10.5px] font-medium px-1.5 py-[2px] rounded leading-tight ' + t.cls + '" ' +
+    'title="' + esc(c.email) + '">' +
+    '<span class="inline-block w-1.5 h-1.5 rounded-full" style="background:' + esc(c.color || t.color) + '"></span>' +
+    esc(t.label) + '</span>';
+}
+
+/** Lista los motivos con su evidencia. Nunca hay una alerta sin explicación. */
+function motivosHtml(motivos, compacto) {
+  if (!motivos || !motivos.length) return '';
+  const items = motivos.slice(0, compacto ? 2 : 6).map(m =>
+    '<li class="flex items-start gap-1.5">' +
+      '<span class="mt-[5px] w-1 h-1 rounded-full bg-ink-400 shrink-0"></span>' +
+      '<span class="min-w-0"><span class="font-medium">' + esc(m.texto || m.regla || '') + '</span>' +
+      (m.evidencia ? '<span class="text-ink-500 dark:text-ink-400"> — ' + esc(m.evidencia) + '</span>' : '') +
+      (m.puntos ? '<span class="text-ink-400 tnum"> (+' + m.puntos + ')</span>' : '') + '</span></li>').join('');
+  return '<ul class="text-[11.5px] leading-relaxed space-y-0.5 mt-1.5">' + items + '</ul>';
+}
+
+function bloquesGoogle() {
+  const conexiones = Google.conexiones;
+  if (!conexiones.length) return '';
+
+  const hayDemo = conexiones.some(c => c.es_demo);
+  const bandeja = Urgencia.bandeja(6);
+  const sinResponder = Urgencia.sinResponder(4);
+  const conflictos = Urgencia.conflictos();
+  const sugerencias = store.all('suggested_actions')
+    .filter(s => s.estado === 'pendiente' && Q.enEspacio({ area: s.area }))
+    .sort((a, b) => (PRIORIDADES[b.prioridad]?.peso || 0) - (PRIORIDADES[a.prioridad]?.peso || 0))
+    .slice(0, 5);
+
+  const hoy = todayISO();
+  const agendaG = store.all('google_calendar_events')
+    .filter(e => e.inicio && String(e.inicio).slice(0, 10) === hoy && e.estado_evento !== 'cancelled' && Q.enEspacio({ area: e.area }))
+    .sort((a, b) => (a.inicio > b.inicio ? 1 : -1));
+
+  const evalsG = store.all('google_calendar_events')
+    .filter(e => e.area === 'universidad' && e.inicio && e.inicio >= nowNaive() &&
+      /control|prueba|examen|certamen|solemne|entrega|evaluaci/i.test(e.titulo || ''))
+    .sort((a, b) => (a.inicio > b.inicio ? 1 : -1)).slice(0, 3);
+
+  const ultima = conexiones.map(c => c.ultima_sync).filter(Boolean).sort().pop();
+  const conProblema = conexiones.filter(c => c.estado === 'reconectar' || c.estado === 'error');
+
+  /* --- Encabezado con estado y acción --- */
+  const encabezado =
+    '<div class="flex flex-wrap items-center justify-between gap-2 mb-3">' +
+      '<div class="flex items-center gap-2 min-w-0">' +
+        '<h2 class="text-[13px] font-semibold text-ink-500 dark:text-ink-400 flex items-center gap-2">' +
+          ico('nube', 15) + 'Cuentas conectadas</h2>' +
+        conexiones.map(c => chipCuenta(c.id)).join('') +
+        (hayDemo ? badge('Ejemplo', 'bg-ink-100 text-ink-500 dark:bg-ink-800 dark:text-ink-300') : '') +
+      '</div>' +
+      '<div class="flex items-center gap-2">' +
+        '<span class="text-[11.5px] text-ink-500 dark:text-ink-400">' +
+          (ultima ? 'Última sincronización: ' + fmtFechaHora(ultima) : 'Sin sincronizar todavía') + '</span>' +
+        btn(ico('refrescar', 15) + 'Sincronizar', 'g-sync-todo', '', BTN.secundario) +
+      '</div>' +
+    '</div>';
+
+  const avisoReconectar = conProblema.length
+    ? '<div class="flex flex-col sm:flex-row sm:items-center gap-2.5 mb-3 p-3 rounded-xl2 border border-warnc-200 dark:border-warnc-500/30 bg-warnc-50 dark:bg-warnc-500/10">' +
+        '<span class="w-8 h-8 shrink-0 rounded-lg grid place-items-center bg-warnc-500 text-white">' + ico('alerta', 16) + '</span>' +
+        '<p class="text-[12.5px] text-ink-700 dark:text-ink-200 flex-1 min-w-0">' +
+          conProblema.map(c => esc(c.email) + ': ' + esc(c.error || 'hay que volver a autorizarla')).join(' · ') + '</p>' +
+        btn('Ir a Configuración', 'ir-config-cuentas', '', BTN.secundario) +
+      '</div>'
+    : '';
+
+  /* --- Bandeja prioritaria --- */
+  const cardBandeja = card(
+    cardTitulo('Bandeja prioritaria', bandeja.length ? badge(bandeja.length + '', 'bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300') : '', 'notas') +
+    (bandeja.length
+      ? '<ul class="divide-y divide-ink-100 dark:divide-ink-800">' + bandeja.map(x =>
+          '<li><button type="button" data-act="g-ver-correo" data-id="' + x.m.id + '" ' +
+            'class="press w-full text-left px-4 py-3 hover:bg-ink-50 dark:hover:bg-ink-850 focus-ring">' +
+            '<div class="flex items-start gap-2">' +
+              '<div class="min-w-0 flex-1">' +
+                '<div class="flex flex-wrap items-center gap-1.5 mb-0.5">' +
+                  badge(CATEGORIA_CORREO[x.categoria].label, CATEGORIA_CORREO[x.categoria].cls) +
+                  chipCuenta(x.m.connection_id) +
+                  (x.m.no_leido ? badge('No leído', 'bg-petrol-100 text-petrol-700 dark:bg-petrol-500/25 dark:text-petrol-100') : '') +
+                '</div>' +
+                '<p class="text-[13.5px] font-medium truncate">' + esc(x.m.asunto) + '</p>' +
+                '<p class="text-[12px] text-ink-500 dark:text-ink-400 truncate">' + esc(x.m.remitente || x.m.remitente_email) +
+                  ' · ' + fmtFechaHora(x.m.fecha) + '</p>' +
+                motivosHtml(x.motivos, true) +
+              '</div>' +
+              '<span class="text-[11px] tnum text-ink-400 shrink-0 mt-0.5">' + x.puntos + '</span>' +
+            '</div></button></li>').join('') + '</ul>'
+      : vacio('Bandeja al día', 'No hay correos que requieran acción en este espacio.')));
+
+  /* --- Agenda de hoy consolidada --- */
+  const cardAgendaG = card(
+    cardTitulo('Agenda de hoy · todas las cuentas', '', 'agenda') +
+    (agendaG.length
+      ? '<ul class="divide-y divide-ink-100 dark:divide-ink-800">' + agendaG.map(e => {
+          const u = Urgencia.evento(e, store.all('google_calendar_events'));
+          const choque = u.motivos.find(m => m.codigo === 'conflicto_agenda' || m.codigo === 'traslado_insuficiente');
+          return '<li class="px-4 py-2.5 flex items-start gap-3">' +
+            '<span class="text-[12px] tnum font-medium text-ink-500 dark:text-ink-400 w-11 shrink-0 pt-0.5">' + fmtHora(e.inicio) + '</span>' +
+            '<span class="w-1 self-stretch rounded-full shrink-0" style="background:' + esc(e.color || Google.colorDe(e.connection_id)) + '"></span>' +
+            '<div class="min-w-0 flex-1">' +
+              '<p class="text-[13.5px] font-medium truncate">' + esc(e.titulo) + '</p>' +
+              '<p class="text-[11.5px] text-ink-500 dark:text-ink-400 truncate">' +
+                (e.lugar ? esc(e.lugar) : e.enlace_reunion ? 'Videollamada' : 'Sin lugar ni enlace') +
+                (e.fin ? ' · hasta ' + fmtHora(e.fin) : '') + '</p>' +
+              (choque ? '<p class="text-[11.5px] text-critc-600 dark:text-critc-300 mt-0.5">' + esc(choque.texto) + '</p>' : '') +
+            '</div>' +
+            chipCuenta(e.connection_id) +
+          '</li>'; }).join('') + '</ul>'
+      : vacio('Sin eventos hoy', 'No hay nada agendado en las cuentas conectadas para este espacio.')));
+
+  /* --- Conflictos --- */
+  const cardConflictos = conflictos.length ? card(
+    cardTitulo('Conflictos de agenda', badge(conflictos.length + '', 'bg-critc-100 text-critc-700 dark:bg-critc-500/20 dark:text-critc-200'), 'alerta') +
+    '<ul class="divide-y divide-ink-100 dark:divide-ink-800">' + conflictos.slice(0, 4).map(c =>
+      '<li class="px-4 py-3">' +
+        '<p class="text-[12.5px] font-medium">' +
+          (c.tipo === 'choque' ? 'Dos eventos se pisan' : 'Traslado imposible: solo ' + c.minutos + ' min') + '</p>' +
+        '<p class="text-[12px] text-ink-600 dark:text-ink-300 mt-1">' +
+          '<span class="tnum">' + fmtHora(c.a.inicio) + '</span> ' + esc(c.a.titulo) + ' ' + chipCuenta(c.a.connection_id) + '</p>' +
+        '<p class="text-[12px] text-ink-600 dark:text-ink-300">' +
+          '<span class="tnum">' + fmtHora(c.b.inicio) + '</span> ' + esc(c.b.titulo) + ' ' + chipCuenta(c.b.connection_id) + '</p>' +
+        (c.tipo === 'traslado'
+          ? '<p class="text-[11.5px] text-ink-500 dark:text-ink-400 mt-1">' + esc(c.a.lugar) + ' → ' + esc(c.b.lugar) + '</p>' : '') +
+      '</li>').join('') + '</ul>') : '';
+
+  /* --- Tareas sugeridas: siempre requieren confirmación --- */
+  const cardSugerencias = card(
+    cardTitulo('Tareas sugeridas', sugerencias.length ? badge(sugerencias.length + '', 'bg-warnc-100 text-warnc-700 dark:bg-warnc-500/20 dark:text-warnc-200') : '', 'tareas') +
+    (sugerencias.length
+      ? '<ul class="divide-y divide-ink-100 dark:divide-ink-800">' + sugerencias.map(s =>
+          '<li class="px-4 py-3">' +
+            '<div class="flex flex-wrap items-center gap-1.5 mb-1">' +
+              badge(PRIORIDADES[s.prioridad].label, PRIORIDADES[s.prioridad].cls) +
+              areaBadge(s.area) + chipCuenta(s.connection_id) +
+              (s.vence ? badge('Vence ' + fmtFechaHora(s.vence), 'bg-ink-100 text-ink-600 dark:bg-ink-800 dark:text-ink-300') : '') +
+            '</div>' +
+            '<p class="text-[13.5px] font-medium">' + esc(s.titulo) + '</p>' +
+            (s.detalle ? '<p class="text-[12px] text-ink-500 dark:text-ink-400 truncate">' + esc(s.detalle) + '</p>' : '') +
+            motivosHtml(s.motivos, true) +
+            '<div class="flex flex-wrap gap-2 mt-2">' +
+              btn(ico('ok', 14) + 'Crear tarea', 'g-aceptar-sug', 'data-id="' + s.id + '"', BTN.secundario) +
+              btn('Descartar', 'g-descartar-sug', 'data-id="' + s.id + '"', BTN.fantasma) +
+            '</div>' +
+          '</li>').join('') + '</ul>' +
+        '<p class="px-4 py-2.5 text-[11.5px] text-ink-500 dark:text-ink-400 border-t border-ink-100 dark:border-ink-800">' +
+          'Nexo nunca crea una tarea sin que la confirmes.</p>'
+      : vacio('Sin sugerencias', 'Cuando aparezca un correo con una petición o un plazo, la propuesta se mostrará acá.')));
+
+  /* --- Pendientes de respuesta --- */
+  const cardPendientes = sinResponder.length ? card(
+    cardTitulo('Pendientes de respuesta', '', 'reloj') +
+    '<ul class="divide-y divide-ink-100 dark:divide-ink-800">' + sinResponder.map(m => {
+      const dias = Math.floor((Date.now() - parseNaive(m.fecha).getTime()) / 86400000);
+      return '<li><button type="button" data-act="g-ver-correo" data-id="' + m.id + '" ' +
+        'class="press w-full text-left px-4 py-2.5 hover:bg-ink-50 dark:hover:bg-ink-850 focus-ring">' +
+        '<p class="text-[13px] font-medium truncate">' + esc(m.asunto) + '</p>' +
+        '<p class="text-[11.5px] text-ink-500 dark:text-ink-400 truncate">' + esc(m.remitente || m.remitente_email) +
+          ' · hace ' + (dias === 0 ? 'menos de un día' : dias + ' día(s)') + '</p>' +
+        '</button></li>'; }).join('') + '</ul>') : '';
+
+  /* --- Próximas evaluaciones detectadas en el calendario --- */
+  const cardEvalsG = evalsG.length ? card(
+    cardTitulo('Próximas evaluaciones · calendario', '', 'evaluacion') +
+    '<ul class="divide-y divide-ink-100 dark:divide-ink-800">' + evalsG.map(e =>
+      '<li class="px-4 py-2.5 flex items-center justify-between gap-3">' +
+        '<div class="min-w-0"><p class="text-[13px] font-medium truncate">' + esc(e.titulo) + '</p>' +
+        '<p class="text-[11.5px] text-ink-500 dark:text-ink-400">' + fmtFechaHora(e.inicio) + '</p></div>' +
+        badge(fmtRelativo(e.inicio), 'bg-uni-50 text-uni-700 dark:bg-uni-500/20 dark:text-uni-100') +
+      '</li>').join('') + '</ul>') : '';
+
+  return '<section class="mb-4">' + encabezado + avisoReconectar +
+    '<div class="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">' +
+      cardBandeja + cardAgendaG + cardSugerencias + cardConflictos + cardPendientes + cardEvalsG +
+    '</div></section>';
+}
 
 
 /* ==========================================================================
@@ -7299,6 +8589,97 @@ Vistas.herramientas = function () {
 /* ==========================================================================
    20. VISTA: CONFIGURACIÓN
    ========================================================================== */
+/* --------------------------------------------------------------------------
+   Configuración → Cuentas conectadas
+   Una tarjeta por cuenta de Google, con lo que hay que saber y poder hacer:
+   qué servicios autorizaste, cuándo se sincronizó por última vez, y los
+   botones de sincronizar, pausar y desconectar.
+   -------------------------------------------------------------------------- */
+function tarjetaCuentasGoogle() {
+  const conexiones = store.all('google_connections');
+  const puede = Nube.conectado;
+
+  const explicacion =
+    '<p class="text-[12px] text-ink-500 dark:text-ink-400 leading-relaxed">' +
+      'Nexo lee tus cuentas de Google <strong>solo para mostrarte lo que importa</strong>: nunca envía correos, ' +
+      'no borra mensajes, no modifica archivos ni crea eventos. Los permisos se guardan cifrados en el servidor de ' +
+      'Nexo y <strong>nunca llegan a este navegador</strong>. Puedes revocarlos cuando quieras.' +
+    '</p>';
+
+  if (!puede) {
+    return card(cardTitulo('Cuentas conectadas', '', 'nube') + '<div class="px-4 pb-4">' +
+      '<div class="flex flex-col sm:flex-row sm:items-center gap-3 p-3.5 rounded-xl2 border border-ink-200 dark:border-ink-800 bg-ink-50 dark:bg-ink-850 mb-3">' +
+        '<span class="w-10 h-10 shrink-0 rounded-xl2 grid place-items-center bg-ink-200 dark:bg-ink-800 text-ink-500">' + ico('info', 20) + '</span>' +
+        '<div class="min-w-0 flex-1"><p class="text-[13.5px] font-semibold">Primero inicia sesión en Nexo</p>' +
+        '<p class="text-[12px] text-ink-500 dark:text-ink-400 mt-0.5">Conectar Google necesita tu cuenta de Nexo: es la que decide qué información es tuya.</p></div>' +
+      '</div>' + explicacion + '</div>');
+  }
+
+  const filaCuenta = (c) => {
+    const t = TIPO_CUENTA_GOOGLE[c.tipo] || TIPO_CUENTA_GOOGLE.trabajo;
+    const e = ESTADO_CUENTA_GOOGLE[c.estado] || ESTADO_CUENTA_GOOGLE.activa;
+    const servicios = ['gmail', 'calendar', 'drive'].filter(s => c[s]);
+    const cuenta = { mensajes: store.where('google_messages', m => m.connection_id === c.id).length,
+      eventos: store.where('google_calendar_events', x => x.connection_id === c.id).length,
+      archivos: store.where('google_drive_items', x => x.connection_id === c.id).length };
+
+    return '<div class="p-3.5 rounded-xl2 border border-ink-200 dark:border-ink-800 mb-2.5">' +
+      '<div class="flex flex-wrap items-start gap-3">' +
+        '<span class="w-10 h-10 shrink-0 rounded-xl2 grid place-items-center text-white font-semibold text-[15px]" ' +
+          'style="background:' + esc(c.color || t.color) + '">' + esc((c.email || '?')[0].toUpperCase()) + '</span>' +
+        '<div class="min-w-0 flex-1">' +
+          '<div class="flex flex-wrap items-center gap-1.5">' +
+            '<p class="text-[13.5px] font-semibold truncate">' + esc(c.email) + '</p>' +
+            badge(t.label, t.cls) + badge(ico(e.ic, 12) + e.label, e.cls) +
+            (c.es_demo ? badge('Ejemplo', 'bg-ink-100 text-ink-500 dark:bg-ink-800 dark:text-ink-300') : '') +
+          '</div>' +
+          '<p class="text-[11.5px] text-ink-500 dark:text-ink-400 mt-1">' +
+            (servicios.length
+              ? 'Autorizado: ' + servicios.map(s => SERVICIOS_GOOGLE[s].label).join(' · ')
+              : 'Sin servicios autorizados') +
+            ' · ' + (c.ultima_sync ? 'sincronizado ' + fmtFechaHora(c.ultima_sync) : 'sin sincronizar') +
+          '</p>' +
+          '<p class="text-[11.5px] text-ink-400 dark:text-ink-500 mt-0.5 tnum">' +
+            cuenta.mensajes + ' correo(s) · ' + cuenta.eventos + ' evento(s) · ' + cuenta.archivos + ' archivo(s)</p>' +
+          (c.error
+            ? '<p class="text-[12px] text-warnc-700 dark:text-warnc-200 mt-1.5 p-2 rounded-lg bg-warnc-50 dark:bg-warnc-500/10">' + esc(c.error) + '</p>'
+            : '') +
+        '</div>' +
+      '</div>' +
+      '<div class="flex flex-wrap gap-2 mt-3">' +
+        (c.estado === 'desconectada'
+          ? btn(ico('plus', 15) + 'Volver a conectar', 'g-conectar', 'data-tipo="' + c.tipo + '" data-correo="' + esc(c.email) + '"', BTN.secundario)
+          : btn(ico('refrescar', 15) + 'Sincronizar ahora', 'g-sync-una', 'data-id="' + c.id + '"', BTN.secundario) +
+            btn(c.estado === 'pausada' ? 'Reanudar' : 'Pausar', 'g-pausar', 'data-id="' + c.id + '"', BTN.fantasma) +
+            btn('Cambiar tipo', 'g-tipo', 'data-id="' + c.id + '"', BTN.fantasma) +
+            btn('Agregar permisos', 'g-permisos', 'data-id="' + c.id + '"', BTN.fantasma) +
+            btn('Desconectar', 'g-desconectar', 'data-id="' + c.id + '"', BTN.peligroSuave)) +
+      '</div>' +
+    '</div>';
+  };
+
+  return card(
+    cardTitulo('Cuentas conectadas',
+      btn(ico('plus', 15) + 'Conectar cuenta Google', 'g-conectar', '', BTN.secundario), 'nube') +
+    '<div class="px-4 pb-4">' +
+      (conexiones.length
+        ? conexiones.map(filaCuenta).join('')
+        : '<div class="px-1 py-6 text-center">' +
+            '<p class="text-[13.5px] font-medium">Todavía no conectas ninguna cuenta</p>' +
+            '<p class="text-[12px] text-ink-500 dark:text-ink-400 mt-1 max-w-md mx-auto">' +
+              'Conecta tu cuenta de trabajo y la de la universidad para ver los correos que necesitan acción, ' +
+              'la agenda de las dos y los documentos recientes en un solo lugar.</p>' +
+            '<div class="mt-3">' + btn(ico('plus', 15) + 'Conectar cuenta Google', 'g-conectar') + '</div>' +
+          '</div>') +
+      '<div class="mt-3 pt-3 border-t border-ink-100 dark:border-ink-800">' + explicacion +
+        '<div class="flex flex-wrap gap-2 mt-2.5">' +
+          btn('Remitentes prioritarios', 'g-remitentes', '', BTN.fantasma) +
+          btn('Reglas de urgencia', 'g-reglas', '', BTN.fantasma) +
+        '</div>' +
+      '</div>' +
+    '</div>');
+}
+
 Vistas.config = function () {
   const p = DB.profile;
   const cfg = Cloud.cfg || {};
@@ -7409,6 +8790,8 @@ Vistas.config = function () {
             '</div>' +
             '<div class="mt-3">' + btn('Cambiar conexión', 'abrir-conexion', '', BTN.fantasma) + '</div>') +
     '</div>') + '</div>' +
+
+    '<div class="lg:col-span-2">' + tarjetaCuentasGoogle() + '</div>' +
 
     '<div class="lg:col-span-2">' + card(cardTitulo('Datos, respaldo y privacidad') + '<div class="px-4 pb-4">' +
       '<div class="flex flex-wrap gap-2 mb-3">' +
@@ -8641,6 +10024,51 @@ document.addEventListener('click', (ev) => {
       sincronizar('ahora');
       break;
 
+    /* --- cuentas de Google --- */
+    case 'ir-config-cuentas': ir('config'); break;
+    case 'g-conectar': abrirConectarGoogle(el.dataset.tipo, el.dataset.correo); break;
+    case 'g-permisos': abrirConectarGoogle(null, null, id); break;
+    case 'g-sync-todo': ejecutarGoogle(null, 'Todo al día'); break;
+    case 'g-sync-una': ejecutarGoogle(id, 'Cuenta sincronizada'); break;
+    case 'g-pausar': {
+      const c = store.get('google_connections', id); if (!c) break;
+      Google.pausar(id, c.estado !== 'pausada');
+      toast(c.estado === 'pausada' ? 'Cuenta en pausa: deja de sincronizar' : 'Cuenta reactivada', 'exito');
+      render(); break;
+    }
+    case 'g-tipo': abrirTipoCuenta(id); break;
+    case 'g-desconectar': abrirDesconectar(id); break;
+    case 'g-ver-correo': verCorreo(id); break;
+    case 'g-abrir-gmail': {
+      const m = store.get('google_messages', id);
+      if (m && m.enlace) window.open(m.enlace, '_blank', 'noopener');
+      break;
+    }
+    case 'g-cuerpo-correo': cargarCuerpoCorreo(id); break;
+    case 'g-aceptar-sug': abrirConfirmarSugerencia(id); break;
+    case 'g-descartar-sug': {
+      store.update('suggested_actions', id, { estado: 'descartada', decidido_en: nowNaive() });
+      toast('Sugerencia descartada'); render(); break;
+    }
+    case 'g-marcar-respondido': {
+      const m = store.get('google_messages', id);
+      if (m) { m.respondido_en = nowNaive(); saveDB(); toast('Marcado como respondido'); }
+      cerrarModal(); render(); break;
+    }
+    case 'g-remitentes': abrirRemitentes(); break;
+    case 'g-reglas': abrirReglasUrgencia(); break;
+    case 'g-borrar-remitente':
+      store.remove('priority_senders', id); toast('Remitente quitado'); abrirRemitentes(); break;
+    case 'g-nuevo-remitente': cerrarModal(); formRemitente(); break;
+    case 'g-set-tipo': {
+      const t = el.dataset.v;
+      if (TIPO_CUENTA_GOOGLE[t]) {
+        store.update('google_connections', id, { tipo: t, color: TIPO_CUENTA_GOOGLE[t].color });
+        toast('Cuenta marcada como ' + TIPO_CUENTA_GOOGLE[t].label.toLowerCase(), 'exito');
+      }
+      cerrarModal(); render(); break;
+    }
+
     /* --- datos --- */
     case 'exportar': {
       const blob = new Blob([JSON.stringify(DB, null, 2)], { type: 'application/json' });
@@ -8694,6 +10122,21 @@ function manejarCampo(e) {
     render();
   }
   else if (a === 'bg-input') { const r = document.getElementById('bg-res'); if (r) r.innerHTML = pintarResultados(el.value); }
+  else if (a === 'g-regla-activa') {
+    /* La primera vez que tocas una regla, las de fábrica pasan a ser tuyas y
+       quedan guardadas en tu cuenta. Desde ahí las ajustas a tu gusto. */
+    const codigo = el.dataset.codigo;
+    if (!store.all('urgency_rules').length) {
+      Urgencia.PORDEFECTO.forEach((r, i) => store.insert('urgency_rules', {
+        codigo: r.codigo, etiqueta: r.etiqueta, descripcion: r.descripcion || '',
+        activa: true, peso: r.peso, params: r.params || {}, aplica_a: r.aplica_a, orden: (i + 1) * 10
+      }));
+    }
+    const regla = store.all('urgency_rules').find(r => r.codigo === codigo);
+    if (regla) store.update('urgency_rules', regla.id, { activa: el.checked });
+    toast(el.checked ? 'Regla activada' : 'Regla desactivada');
+    abrirReglasUrgencia();
+  }
 }
 document.addEventListener('input', manejarCampo);
 document.addEventListener('change', manejarCampo);
